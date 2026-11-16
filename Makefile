@@ -1,8 +1,9 @@
 # Copyright (c) 2026 UCLA Networked & Embedded Systems Laboratory
 # SPDX-License-Identifier: BSD-3-Clause
-.PHONY: help install test integration-test test-all start-gpu start-hil smoke env-create arduino-setup stm32-setup prepare-dataset prepare-audio-dataset clean
+.PHONY: help install test integration-test test-all start-gpu start-hil smoke env-create arduino-setup arduino-tflite-patch stm32-setup prepare-dataset prepare-audio-dataset clean
 
 PYTHON ?= python
+PATCH_ACTION ?= apply
 ENV ?= crest
 OXIOD_ZIP ?= OxIOD.zip
 URBANSOUND8K_ARGS ?=
@@ -20,6 +21,7 @@ help:
 	@echo "  smoke          Run a short NAS smoke test (override ARGS)"
 	@echo "  env-create     Create conda env from environment.yml"
 	@echo "  arduino-setup  Run Arduino CLI bootstrapper"
+	@echo "  arduino-tflite-patch  Apply the opt-in 4-bit activation patch to the Arduino TFLite Micro submodule (PATCH_ACTION=apply|revert|status)"
 	@echo "  stm32-setup    Validate STM32CubeCLT paths and bootstrap STM32CubeN6 firmware"
 	@echo "  prepare-dataset  Prepare OxIOD dataset (override OXIOD_ZIP=/path/to/OxIOD.zip)"
 	@echo "  prepare-audio-dataset  Prepare UrbanSound8K log-mel cache (use URBANSOUND8K_ARGS=\"--fold-rotation\" for Phase 9 reports)"
@@ -51,6 +53,9 @@ env-create:
 
 arduino-setup:
 	bash ./setup_arduino.sh
+
+arduino-tflite-patch:
+	bash ./env_setup/apply_arduino_tflite_patch.sh $(PATCH_ACTION)
 
 stm32-setup:
 	bash ./setup_stm32.sh
