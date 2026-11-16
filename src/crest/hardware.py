@@ -293,6 +293,9 @@ def convert_to_tflite_model(
     provided calibration data.
     The model is converted with a batch size of 1, so every tensor shape in
     the flatbuffer is static (see ``_with_batch_size_one``).
+    In ``int8_ptq`` mode dense layers get one weight scale each (convolutions
+    stay per channel), because the pinned Arduino TensorFlow Lite Micro
+    library mis-executes per-channel dense layers.
     Input and output dtypes stay ``float32`` unless ``int8_ptq`` is selected.
 
     Raises
@@ -338,6 +341,9 @@ def convert_to_tflite_model(
         converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
         converter.inference_input_type = tf.int8
         converter.inference_output_type = tf.int8
+        # One scale per dense layer. TensorFlow 2.20 quantizes FULLY_CONNECTED weights per channel by default, and
+        # the pinned Arduino TensorFlow Lite Micro library applies only the first channel's scale to all of them.
+        converter._experimental_disable_per_channel_quantization_for_dense_layers = True
 
     flatbuffer = converter.convert()
     # Persist the flatbuffer so the downstream conversion step can embed it.

@@ -190,6 +190,30 @@ class ConversionHelperTests(TinyModelMixin, unittest.TestCase):
             predicted = predict_tflite_model(Path(tmpdir) / "tcn_float.tflite", calibration[:3])
         np.testing.assert_allclose(np.asarray(predicted), model.predict(calibration[:3], verbose=0), atol=1e-4)
 
+    def test_convert_to_tflite_model_int8_dense_layers_are_per_tensor(self) -> None:
+        """Dense weights get one scale each while convolution weights stay per channel."""
+        from tensorflow.lite.python import schema_py_generated as schema
+
+        inputs = tf.keras.Input(shape=(8, 8, 2))
+        features = tf.keras.layers.Conv2D(4, 3, activation="relu")(inputs)
+        features = tf.keras.layers.Flatten()(features)
+        model = tf.keras.Model(inputs, tf.keras.layers.Dense(3)(tf.keras.layers.Dense(6, activation="relu")(features)))
+        data = np.random.default_rng(2).normal(size=(8, 8, 8, 2)).astype(np.float32)
+        names = {value: key for key, value in vars(schema.BuiltinOperator).items() if not key.startswith("_")}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "dense.tflite"
+            convert_to_tflite_model(model, data, quantization_mode="int8_ptq", output_name=path)
+            flat = schema.ModelT.InitFromPackedBuf(path.read_bytes(), 0)
+        graph = flat.subgraphs[0]
+        scales = {}
+        for op in graph.operators:
+            code = flat.operatorCodes[op.opcodeIndex]
+            name = names[max(code.builtinCode, code.deprecatedBuiltinCode)]
+            if name in ("CONV_2D", "FULLY_CONNECTED"):
+                scales.setdefault(name, []).append(len(graph.tensors[op.inputs[1]].quantization.scale))
+        self.assertEqual(scales["FULLY_CONNECTED"], [1, 1])
+        self.assertEqual(scales["CONV_2D"], [4])
+
     def test_convert_to_tflite_model_keeps_multi_output_order(self) -> None:
         """Fixing the batch keeps the outputs in Keras order for host prediction."""
         inputs = tf.keras.Input(shape=(6,))

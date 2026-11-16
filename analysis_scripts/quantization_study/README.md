@@ -116,9 +116,8 @@ python analysis_scripts/quantization_study/quantization_study.py export-int4-act
   Across four `--seed` values, the all-feature-map models' test macro-F1 moved by up to 4 points, so compare seeds before drawing conclusions.
 - No stock runtime executes the output, and TensorFlow's interpreter does not either.
   Apply the [4-bit activation patch](../../env_setup/patches/README.md) to the Arduino TensorFlow Lite Micro library first.
-- The pinned Arduino library ignores all but the first per-channel scale of dense layers in TensorFlow 2.20 exports.
-  This was reproduced on a host build and not on a board.
-  Convert the base model with `converter._experimental_disable_per_channel_quantization_for_dense_layers = True` before comparing on-device outputs.
+- The pinned Arduino library ignores all but the first per-channel scale of dense layers in TensorFlow 2.20 exports (reproduced on a host build, not on a board).
+  CREST's `convert_to_tflite_model` now quantizes dense layers per tensor; older exports, or exports made elsewhere, trigger a warning.
 
 ## Outputs
 

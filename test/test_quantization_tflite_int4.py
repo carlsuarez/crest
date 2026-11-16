@@ -326,10 +326,14 @@ def test_pooling_joins_groups_and_exports(pool_model) -> None:
 def test_warnings_flag_exports_the_pinned_runtime_miscomputes(tcn_model, tmp_path) -> None:
     """A dynamic batch with space-to-batch operators, and per-channel dense layers, are both reported."""
     data, clips = tcn_model
-    fixed = q4.model_warnings(data)
-    assert not any("dynamic batch" in warning for warning in fixed)
-    assert any("per-channel" in warning for warning in fixed)
+    # CREST's converter now fixes the batch and makes dense layers per-tensor, so its exports raise no warning.
+    assert q4.model_warnings(data) == []
+    converter = tf.lite.TFLiteConverter.from_keras_model(_tcn((1, 40, 3)))
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.representative_dataset = lambda: ([tf.constant(c[np.newaxis])] for c in clips[:8])
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    assert any("per-channel" in warning for warning in q4.model_warnings(converter.convert()))
     # CREST's converter now fixes the batch, so build the old dynamic-batch export with TensorFlow directly.
     dynamic = q4.model_warnings(tf.lite.TFLiteConverter.from_keras_model(_tcn(None)).convert())
     assert any("SPACE_TO_BATCH_ND" in warning for warning in dynamic)
-    assert not any("dynamic batch" in w for w in q4.model_warnings(_convert(_tcn(None), clips, tmp_path / "f.tflite")))
+    assert q4.model_warnings(_convert(_tcn(None), clips, tmp_path / "f.tflite")) == []
