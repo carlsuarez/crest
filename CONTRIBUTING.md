@@ -27,7 +27,7 @@ make test
 ```
 
 The default suite needs no connected board or live LLM credentials.
-It excludes integration tests and three opt-in analysis test modules.
+It excludes integration tests and four opt-in analysis test modules.
 To include those analysis tests, run the following command.
 
 ```bash

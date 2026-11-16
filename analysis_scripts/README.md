@@ -18,6 +18,7 @@ Run commands from the repository root with the `crest` Conda environment active 
 | [Waiting-policy experiments](cs1/README.md#collect-new-measurements) | Compare prepared continuous, awake-final, and STOP-final deployments |
 | [Micro-workload probe](appendix_measurement_context/README.md#micro-workload-energy-probe) | Fixed-duration board measurements for sleep and compute phases |
 | [Training budget](appendix_training_budget/README.md#training-budget-experiment) | Train and evaluate candidates at different checkpoint budgets |
+| [Quantization study](quantization_study/README.md) | Train fixed candidates and simulate uniform weight and activation quantization on the host |
 
 Hardware runners require a target board, measurement harness, and device setup from their guides.
 Run only one experiment at a time on a DUT/harness.

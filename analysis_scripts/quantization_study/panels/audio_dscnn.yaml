@@ -1,0 +1,83 @@
+# Copyright (c) 2026 UCLA Networked & Embedded Systems Laboratory
+# SPDX-License-Identifier: BSD-3-Clause
+# Fixed audio_dscnn candidates for the quantization study.
+# small, medium, and large span the family's size range.
+# medium_relu6 and medium_no_bn change one factor each relative to medium:
+# a bounded activation, and no BatchNorm to fold into the convolutions.
+family: audio_dscnn
+candidates:
+  small:
+    base_channels: 8
+    num_blocks: 3
+    kernel_time: 3
+    kernel_freq: 3
+    stride_schedule: aggressive
+    channel_growth: 1.5
+    max_channels: 64
+    depth_multiplier: 1
+    pointwise_scale: 1.0
+    dropout_rate: 0.1
+    norm_flag: true
+    dense_units: 0
+    global_pool_type: avg
+    activation: relu
+  medium:
+    base_channels: 16
+    num_blocks: 4
+    kernel_time: 3
+    kernel_freq: 3
+    stride_schedule: balanced
+    channel_growth: 1.5
+    max_channels: 96
+    depth_multiplier: 1
+    pointwise_scale: 1.0
+    dropout_rate: 0.2
+    norm_flag: true
+    dense_units: 32
+    global_pool_type: avg
+    activation: relu
+  large:
+    base_channels: 32
+    num_blocks: 5
+    kernel_time: 5
+    kernel_freq: 3
+    stride_schedule: balanced
+    channel_growth: 1.5
+    max_channels: 128
+    depth_multiplier: 1
+    pointwise_scale: 1.25
+    dropout_rate: 0.2
+    norm_flag: true
+    dense_units: 64
+    global_pool_type: avg
+    activation: relu
+  medium_relu6:
+    base_channels: 16
+    num_blocks: 4
+    kernel_time: 3
+    kernel_freq: 3
+    stride_schedule: balanced
+    channel_growth: 1.5
+    max_channels: 96
+    depth_multiplier: 1
+    pointwise_scale: 1.0
+    dropout_rate: 0.2
+    norm_flag: true
+    dense_units: 32
+    global_pool_type: avg
+    activation: relu6
+  medium_no_bn:
+    base_channels: 16
+    num_blocks: 4
+    kernel_time: 3
+    kernel_freq: 3
+    stride_schedule: balanced
+    channel_growth: 1.5
+    max_channels: 96
+    depth_multiplier: 1
+    pointwise_scale: 1.0
+    dropout_rate: 0.2
+    norm_flag: false
+    dense_units: 32
+    global_pool_type: avg
+    activation: relu

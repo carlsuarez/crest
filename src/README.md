@@ -44,6 +44,7 @@ For contribution standards and test commands, see [Contributing](../CONTRIBUTING
 | [`crest/model.py`](crest/model.py), [`runtime_bootstrap.py`](crest/runtime_bootstrap.py) | Configuration, scoring, and component initialization |
 | [`crest/pareto_replay.py`](crest/pareto_replay.py) | Candidate selection and request reconstruction for Pareto HIL replay |
 | [`crest/devices.py`](crest/devices.py), [`hardware.py`](crest/hardware.py) | Device contracts and shared hardware utilities |
+| [`crest/quantization/`](crest/quantization) | Simulated uniform quantization for host-side precision studies |
 
 ## Shared contracts
 

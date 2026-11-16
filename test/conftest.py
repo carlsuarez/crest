@@ -10,6 +10,7 @@ ANALYSIS_SCRIPT_TESTS = {
     "test_compare_pareto_fronts.py",
     "test_cs3_audio_sensitivity.py",
     "test_micro_workload_energy_probe.py",
+    "test_quantization_study.py",
 }
 
 
