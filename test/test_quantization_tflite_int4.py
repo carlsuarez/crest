@@ -329,5 +329,7 @@ def test_warnings_flag_exports_the_pinned_runtime_miscomputes(tcn_model, tmp_pat
     fixed = q4.model_warnings(data)
     assert not any("dynamic batch" in warning for warning in fixed)
     assert any("per-channel" in warning for warning in fixed)
-    dynamic = q4.model_warnings(_convert(_tcn(None), clips, tmp_path / "dynamic.tflite"))
+    # CREST's converter now fixes the batch, so build the old dynamic-batch export with TensorFlow directly.
+    dynamic = q4.model_warnings(tf.lite.TFLiteConverter.from_keras_model(_tcn(None)).convert())
     assert any("SPACE_TO_BATCH_ND" in warning for warning in dynamic)
+    assert not any("dynamic batch" in w for w in q4.model_warnings(_convert(_tcn(None), clips, tmp_path / "f.tflite")))

@@ -229,6 +229,38 @@ if not XXD_BIN:
 # -----------------------------------------------------------------------------
 # Conversion helpers
 # -----------------------------------------------------------------------------
+def _with_batch_size_one(model: tf.keras.Model) -> tf.keras.Model:
+    """Return ``model`` with its batch dimension fixed at 1 for conversion.
+
+    Parameters
+    ----------
+    model : tf.keras.Model
+        Keras model whose inputs may have a dynamic batch dimension.
+
+    Returns
+    -------
+    tf.keras.Model
+        A functional model that calls ``model`` on batch-1 inputs, sharing its
+        layers and weights, or ``model`` itself when its batch is already 1 or
+        it has no symbolic inputs.
+
+    Notes
+    -----
+    Deployment runtimes allocate from the shapes stored in the flatbuffer.
+    With a dynamic batch, the converter lowers dilated convolutions such as
+    keras-tcn's Conv1D layers to ``SPACE_TO_BATCH_ND`` and ``BATCH_TO_SPACE_ND``
+    and stores batch 1 in tensors whose real batch is the dilation, so TensorFlow
+    Lite Micro computes wrong outputs. With batch 1 fixed, the converter emits
+    dilated convolutions and static shapes instead.
+    """
+    inputs = list(getattr(model, "inputs", None) or [])
+    if not inputs or all(tensor.shape[0] == 1 for tensor in inputs):
+        return model
+    fixed = [tf.keras.Input(batch_shape=(1, *tuple(tensor.shape[1:])), dtype=tensor.dtype) for tensor in inputs]
+    outputs = model(fixed[0] if len(fixed) == 1 else fixed)
+    return tf.keras.Model(fixed[0] if len(fixed) == 1 else fixed, outputs)
+
+
 def convert_to_tflite_model(
     model: tf.keras.Model,
     training_data=None,
@@ -258,8 +290,10 @@ def convert_to_tflite_model(
     Notes
     -----
     The representative dataset is capped at an evenly sampled subset of the
-    provided calibration data. Input and output dtypes stay ``float32`` unless
-    ``int8_ptq`` is selected.
+    provided calibration data.
+    The model is converted with a batch size of 1, so every tensor shape in
+    the flatbuffer is static (see ``_with_batch_size_one``).
+    Input and output dtypes stay ``float32`` unless ``int8_ptq`` is selected.
 
     Raises
     ------
@@ -270,7 +304,7 @@ def convert_to_tflite_model(
     normalized_mode = str(quantization_mode).strip().lower()
     if normalized_mode not in VALID_TFLITE_QUANTIZATION_MODES:
         raise ValueError("quantization_mode must be one of: float, int8_ptq.")
-    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter = tf.lite.TFLiteConverter.from_keras_model(_with_batch_size_one(model))
     converter.inference_input_type = tf.float32
     converter.inference_output_type = tf.float32
 

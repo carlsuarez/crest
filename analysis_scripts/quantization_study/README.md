@@ -111,7 +111,7 @@ python analysis_scripts/quantization_study/quantization_study.py export-int4-act
 - The output next to the model, `<output>.json`, lists each group and tensor with its int8 and int4 scale and zero point and clipping range, every group kept at int8 with the reason, the estimated peak for int8 and int4, warnings, and the input and output hashes.
 - Warnings flag exports that the pinned Arduino runtime computes wrongly even at int8.
   A model exported with a dynamic batch stores batch 1 in its `SPACE_TO_BATCH_ND` and `BATCH_TO_SPACE_ND` tensors (dilated Conv1D layers), and TensorFlow Lite Micro's outputs are then unrelated to TFLite's.
-  Export from a model with a fixed batch of 1, which also turns those operators into dilated convolutions.
+  CREST's `convert_to_tflite_model` now exports with a fixed batch of 1, which also turns those operators into dilated convolutions; files exported before that change, or elsewhere, can still trigger the warning.
 - Accuracy depends on the calibration sample.
   Across four `--seed` values, the all-feature-map models' test macro-F1 moved by up to 4 points, so compare seeds before drawing conclusions.
 - No stock runtime executes the output, and TensorFlow's interpreter does not either.

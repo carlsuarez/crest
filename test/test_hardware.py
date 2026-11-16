@@ -162,6 +162,51 @@ class ConversionHelperTests(TinyModelMixin, unittest.TestCase):
             self.assertTrue(tflite_path.exists())
             self.assertGreater(tflite_path.stat().st_size, 0)
 
+    def test_convert_to_tflite_model_fixes_batch_for_dilated_tcn(self) -> None:
+        """A dynamic-batch TCN converts with static shapes and dilated convolutions, not space-to-batch."""
+        from tensorflow.lite.python import schema_py_generated as schema
+
+        inputs = tf.keras.Input(shape=(32, 3))
+        features = TCN(nb_filters=4, kernel_size=3, dilations=[1, 4], return_sequences=False)(inputs)
+        model = tf.keras.Model(inputs, tf.keras.layers.Dense(1)(features))
+        calibration = np.random.default_rng(0).normal(size=(8, 32, 3)).astype(np.float32)
+        names = {value: key for key, value in vars(schema.BuiltinOperator).items() if not key.startswith("_")}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for mode in ("float", "int8_ptq"):
+                path = Path(tmpdir) / f"tcn_{mode}.tflite"
+                convert_to_tflite_model(model, calibration, quantization_mode=mode, output_name=path)
+                flat = schema.ModelT.InitFromPackedBuf(path.read_bytes(), 0)
+                graph = flat.subgraphs[0]
+                ops = {
+                    names[max(flat.operatorCodes[op.opcodeIndex].builtinCode,
+                              flat.operatorCodes[op.opcodeIndex].deprecatedBuiltinCode)]
+                    for op in graph.operators
+                }
+                self.assertNotIn("SPACE_TO_BATCH_ND", ops)
+                self.assertNotIn("BATCH_TO_SPACE_ND", ops)
+                for tensor in graph.tensors:
+                    signature = tensor.shapeSignature
+                    self.assertTrue(signature is None or all(int(dim) >= 0 for dim in signature))
+            predicted = predict_tflite_model(Path(tmpdir) / "tcn_float.tflite", calibration[:3])
+        np.testing.assert_allclose(np.asarray(predicted), model.predict(calibration[:3], verbose=0), atol=1e-4)
+
+    def test_convert_to_tflite_model_keeps_multi_output_order(self) -> None:
+        """Fixing the batch keeps the outputs in Keras order for host prediction."""
+        inputs = tf.keras.Input(shape=(6,))
+        hidden = tf.keras.layers.Dense(4, activation="relu")(inputs)
+        model = tf.keras.Model(
+            inputs, [tf.keras.layers.Dense(1, name="first")(hidden), tf.keras.layers.Dense(2, name="second")(hidden)]
+        )
+        data = np.random.default_rng(1).normal(size=(5, 6)).astype(np.float32)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "two_heads.tflite"
+            convert_to_tflite_model(model, data, quantization_mode="float", output_name=path)
+            predicted = predict_tflite_model(path, data)
+        expected = model.predict(data, verbose=0)
+        self.assertEqual([np.asarray(p).shape for p in predicted], [e.shape for e in expected])
+        for got, want in zip(predicted, expected):
+            np.testing.assert_allclose(np.asarray(got), want, atol=1e-5)
+
     def test_convert_to_tflite_model_quantized_flow(self):
         # Quantized TFLite conversion should still follow the expected end-to-end artifact path.
         """Validate convert to tflite model quantized flow."""
