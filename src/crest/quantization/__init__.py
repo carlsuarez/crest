@@ -5,7 +5,8 @@
 ``crest.quantization.uniform`` holds NumPy uniform quantizers and range
 estimators.
 ``crest.quantization.keras_sim`` applies them to trained Keras models.
-Import it explicitly, because it loads TensorFlow.
+``crest.quantization.tflite_int4_activations`` rewrites int8 TFLite models so feature maps are 4-bit tensors.
+Import those two explicitly, because they load TensorFlow.
 
 Nothing in this package changes CREST's deployment exports or the
 ``training.quantization`` modes used by search.

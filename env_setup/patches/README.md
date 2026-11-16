@@ -37,8 +37,9 @@ The patch leaves the submodule pointer unchanged, so `git status` shows the subm
 
 - Feature maps must be INT4 tensors with int8 weights, and the 4-bit tensors must be outputs of convolutions consumed by convolutions or by a global average pool.
   Other operators, dilation along the height, and batch sizes above one are not supported.
-- TensorFlow's converter cannot emit INT4 activation tensors, and CREST has no export path for them yet.
-  The patch alone does not change what CREST builds.
+- TensorFlow's converter cannot emit INT4 activation tensors.
+  Create them from an int8 export with the [`export-int4-activations`](../../analysis_scripts/quantization_study/README.md#export-a-model-with-4-bit-feature-maps) command of the quantization study.
+  CREST's search and deployment paths do not use them yet, so the patch alone does not change what CREST builds.
 - It applies to the Arduino TensorFlow Lite Micro path only.
   The STM32 path uses ST's runtime, which has no 4-bit activations.
 

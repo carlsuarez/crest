@@ -9,7 +9,7 @@ No hardware required.
 This study measures how simulated uniform quantization of weights and activations changes the task metrics of trained CREST models.
 It runs on the host with the dataset, task, and model family of a CREST config.
 It does not run search or change `training.quantization`.
-Its only deployable artifact is a reference TFLite int8 export.
+Its deployable artifacts are a reference TFLite int8 export and, through `export-int4-activations`, int8 models rewritten with 4-bit feature maps for the opt-in Arduino patch.
 
 Follow the [common command setup](../README.md) and run commands from the repository root, because CREST configs use repository-relative dataset paths.
 
@@ -83,6 +83,36 @@ python analysis_scripts/quantization_study/quantization_study.py plot \
   --results-dir /path/to/quant_results
 ```
 
+## Export a model with 4-bit feature maps
+
+TensorFlow's converter cannot emit 4-bit activation tensors, so this command rewrites an existing int8 export.
+It stores chosen feature maps (the outputs of convolution and depthwise layers) as INT4 tensors and leaves weights and every other tensor unchanged.
+
+```sh
+python analysis_scripts/quantization_study/quantization_study.py export-int4-activations \
+  --config src/config/nas_config_audio_stm32.yaml \
+  --tflite /path/to/quant_results/tflite/medium_int8_ptq.tflite \
+  --output /path/to/int4/medium.tflite --tensors minimal
+```
+
+- The command measures each chosen tensor on the same calibration clips as the int8 export, with TFLite's built-in kernels.
+  It picks a 4-bit range per tensor with `--range-method` (default `mse`), then rescales the biases of the layers that read the tensor.
+  Min-max ranges lose far more accuracy at 4 bits than MSE ranges.
+- `--tensors all` converts every feature map the runtime can handle.
+  `--tensors minimal` converts the smallest set with the same estimated memory peak, which keeps the other feature maps at 8 bits and loses less accuracy.
+  Explicit tensor indices (comma-separated) are also accepted.
+- The memory estimate is the largest total of simultaneously live activation tensors, in 16-byte units, with TFLite Micro's tensor lifetimes.
+  It excludes kernel scratch and persistent data, and the planner can fragment.
+  On the medium and large audio models it equalled the planner's activation region exactly, so confirm with the runtime's arena report.
+- The output next to the model, `<output>.json`, lists each tensor's int8 and int4 scale and zero point, the clipping range, the estimated peak for int8 and int4, and the input and output hashes.
+- Accuracy depends on the calibration sample.
+  Across four `--seed` values, the all-feature-map models' test macro-F1 moved by up to 4 points, so compare seeds before drawing conclusions.
+- No stock runtime executes the output, and TensorFlow's interpreter does not either.
+  Apply the [4-bit activation patch](../../env_setup/patches/README.md) to the Arduino TensorFlow Lite Micro library first.
+- The pinned Arduino library ignores all but the first per-channel scale of dense layers in TensorFlow 2.20 exports.
+  This was reproduced on a host build and not on a board.
+  Convert the base model with `converter._experimental_disable_per_channel_quantization_for_dense_layers = True` before comparing on-device outputs.
+
 ## Outputs
 
 | File | Contents |
@@ -92,6 +122,7 @@ python analysis_scripts/quantization_study/quantization_study.py plot \
 | `layers.csv` | Quantizable layers per model in execution order, with shapes and folded BatchNorm layers |
 | `metadata.json` | Inputs, hashes, versions, calibration details, and simulation conventions |
 | `tflite/<model>_int8_ptq.tflite` | The reference int8 export |
+| `<output>.tflite` and `<output>.json` (`export-int4-activations`) | The model with 4-bit feature maps and its report |
 | `figures/summary.csv` | Float, TFLite int8, and simulated W8A8 metrics, and the smallest widths within `--tolerance` of float |
 | `figures/*.png` | Bit-width curves, weight-by-activation grids, granularity and clipping comparisons, and layer sensitivity |
 
@@ -105,6 +136,7 @@ Keep outputs outside the checkout.
 ## Interpreting results
 
 - CREST currently exports float32 and int8 models only, so widths below 8 bits change accuracy but not measured flash, RAM, latency, or energy.
+  The one exception is `export-int4-activations`, which needs the 4-bit activation patch and has not been run on a board.
 - These are post-training results.
   Quantization-aware training can recover much of the loss at low widths.
 - `sim_w8a8_minus_tflite` in the summary shows how far the simulation's quantization points are from a real int8 graph for each model.
@@ -116,7 +148,7 @@ Keep outputs outside the checkout.
 ## Tests
 
 ```sh
-python -m pytest -q test/test_quantization_uniform.py test/test_quantization_keras_sim.py
+python -m pytest -q test/test_quantization_uniform.py test/test_quantization_keras_sim.py test/test_quantization_tflite_int4.py
 RUN_ANALYSIS_SCRIPT_TESTS=1 python -m pytest -q test/test_quantization_study.py
 ```
 

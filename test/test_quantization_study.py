@@ -92,6 +92,10 @@ def test_parsers_and_names_reject_bad_input():
         study.parse_int_list("2,x")
     with pytest.raises(Exception):
         study.parse_name_list("bits,unknown", study.EXPERIMENTS)
+    assert study.parse_tensor_selection(" Minimal ") == "minimal"
+    assert study.parse_tensor_selection("12,3,12") == (3, 12)
+    with pytest.raises(Exception):
+        study.parse_tensor_selection("every")
     with pytest.raises(ValueError):
         study.validate_name("../escape", kind="model")
     with pytest.raises(ValueError):
@@ -327,6 +331,32 @@ def test_train_sweep_and_plot_end_to_end(tmp_path):
     assert metadata["calibration"]["samples"] == 20
     with pytest.raises(ValueError):
         study.main(sweep_args)
+
+    source_model = results_dir / "tflite" / "small_int8_ptq.tflite"
+    export_output = tmp_path / "int4_activations" / "small.tflite"
+    export_args = [
+        "export-int4-activations",
+        "--config",
+        str(config_path),
+        "--tflite",
+        str(source_model),
+        "--output",
+        str(export_output),
+    ]
+    assert study.main(export_args + ["--tensors", "minimal"]) == 0
+    export_report = json.loads(export_output.with_suffix(".json").read_text(encoding="utf-8"))
+    assert export_report["selection"] == "minimal" and export_report["tensors"]
+    peak = export_report["estimated_activation_peak_bytes"]
+    assert peak["int4"] <= peak["int8"]
+    assert export_report["source_sha256"] == study.sha256_file(source_model)
+    assert export_report["output_sha256"] == study.sha256_file(export_output)
+    assert export_report["buffers_16_byte_aligned"] is True
+    with pytest.raises(ValueError):
+        study.main(export_args)
+    assert study.main(export_args + ["--tensors", "all", "--overwrite"]) == 0
+    all_report = json.loads(export_output.with_suffix(".json").read_text(encoding="utf-8"))
+    assert all_report["selection"] == "all"
+    assert len(all_report["tensors"]) >= len(export_report["tensors"])
 
     assert study.main(["plot", "--results-dir", str(results_dir), "--metric", "accuracy"]) == 0
     figures = results_dir / "figures"

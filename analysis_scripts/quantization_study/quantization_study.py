@@ -14,6 +14,10 @@ sweep
     configuration to ``results.csv``.
 plot
     Summarize ``results.csv`` and plot it, with a numeric sidecar per figure.
+export-int4-activations
+    Rewrite an int8 TFLite model so chosen feature maps are 4-bit tensors, for
+    the opt-in 4-bit activation patch of the Arduino TensorFlow Lite Micro
+    library.
 
 No subcommand runs search or accesses hardware.
 Run from the repository root with the ``crest`` environment active, because
@@ -1143,6 +1147,99 @@ def run_sweep(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# export-int4-activations
+# --------------------------------------------------------------------------
+def parse_tensor_selection(raw: str) -> str | tuple[int, ...]:
+    """Parse ``--tensors``: ``all``, ``minimal``, or comma-separated tensor indices.
+
+    Parameters
+    ----------
+    raw : str
+        Option text.
+
+    Returns
+    -------
+    str | tuple[int, ...]
+        The keyword, or sorted unique tensor indices.
+
+    Raises
+    ------
+    argparse.ArgumentTypeError
+        If the text is neither a keyword nor an integer list.
+    """
+    text = raw.strip().lower()
+    return text if text in {"all", "minimal"} else parse_int_list(text)
+
+
+def run_export_int4_activations(args: argparse.Namespace) -> int:
+    """Rewrite an int8 TFLite model with 4-bit feature maps and write a report.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed ``export-int4-activations`` options.
+
+    Returns
+    -------
+    int
+        Process exit code.
+
+    Raises
+    ------
+    ValueError
+        If the output exists without ``--overwrite`` or the input is missing.
+    """
+    from crest.quantization.tflite_int4_activations import export_int4_activations
+
+    source, output = Path(args.tflite), Path(args.output)
+    report_path = output.with_suffix(".json")
+    if not source.is_file():
+        raise ValueError(f"TFLite model not found: {source}.")
+    existing = [path for path in (output, report_path) if path.exists()]
+    if existing and not args.overwrite:
+        raise ValueError(f"{existing[0]} already exists; pass --overwrite to replace it.")
+
+    _, pipeline = load_pipeline(args.config)
+    _, calibration, calibration_source = select_calibration(pipeline)
+    rewritten, report = export_int4_activations(
+        source.read_bytes(),
+        calibration,
+        tensors=args.tensors,
+        range_method=args.range_method,
+        percentile=args.percentile,
+        max_values=args.max_calibration_values,
+        seed=args.seed,
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(rewritten)
+    report.update(
+        {
+            "created_utc": utc_now(),
+            "config": str(args.config),
+            "source_model": str(source),
+            "source_sha256": sha256_file(source),
+            "output_model": str(output),
+            "output_sha256": sha256_file(output),
+            "output_bytes": output.stat().st_size,
+            "calibration_source_split": calibration_source,
+            "versions": runtime_versions(),
+        }
+    )
+    write_json(report_path, report)
+    peak = report["estimated_activation_peak_bytes"]
+    logger.info(
+        "Stored %d tensors as INT4; estimated activation peak %d -> %d bytes (%.0f%%). Wrote %s and %s.",
+        len(report["tensors"]),
+        peak["int8"],
+        peak["int4"],
+        100.0 * peak["int4"] / peak["int8"],
+        output,
+        report_path,
+    )
+    return 0
+
+
+# --------------------------------------------------------------------------
 # plot
 # --------------------------------------------------------------------------
 def _bits(value: str) -> int | None:
@@ -2175,6 +2272,44 @@ def build_parser() -> argparse.ArgumentParser:
     sweep.add_argument("--seed", type=int, default=0, help="Calibration sampling seed (default: %(default)s).")
     sweep.add_argument("--overwrite", action="store_true", help="Allow an existing results.csv to be replaced.")
     sweep.set_defaults(handler=run_sweep)
+
+    export = commands.add_parser(
+        "export-int4-activations",
+        help="Store feature maps of an int8 TFLite model as 4-bit tensors (needs the 4-bit activation patch to run).",
+    )
+    export.add_argument("--config", type=Path, required=True, help="CREST YAML config (calibration data).")
+    export.add_argument("--tflite", type=Path, required=True, help="Input int8 .tflite, for example from sweep.")
+    export.add_argument(
+        "--output", type=Path, required=True, help="Output .tflite; the report goes next to it as .json."
+    )
+    export.add_argument(
+        "--tensors",
+        type=parse_tensor_selection,
+        default="all",
+        help="'all' feature maps, the 'minimal' set with the same estimated memory peak, or tensor indices "
+        "(default: %(default)s).",
+    )
+    export.add_argument(
+        "--range-method",
+        choices=RANGE_METHODS,
+        default="mse",
+        help="4-bit clipping estimator (default: %(default)s).",
+    )
+    export.add_argument(
+        "--percentile",
+        type=float,
+        default=DEFAULT_ACTIVATION_PERCENTILE,
+        help="Percentile for --range-method percentile.",
+    )
+    export.add_argument(
+        "--max-calibration-values",
+        type=int,
+        default=500_000,
+        help="Stored calibration values per tensor (default: %(default)s).",
+    )
+    export.add_argument("--seed", type=int, default=0, help="Calibration sampling seed (default: %(default)s).")
+    export.add_argument("--overwrite", action="store_true", help="Allow an existing output to be replaced.")
+    export.set_defaults(handler=run_export_int4_activations)
 
     plot = commands.add_parser("plot", help="Summarize and plot sweep results.")
     plot.add_argument("--results-dir", type=Path, required=True, help="Directory written by the sweep subcommand.")
