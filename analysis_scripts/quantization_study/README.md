@@ -86,7 +86,8 @@ python analysis_scripts/quantization_study/quantization_study.py plot \
 ## Export a model with 4-bit feature maps
 
 TensorFlow's converter cannot emit 4-bit activation tensors, so this command rewrites an existing int8 export.
-It stores chosen feature maps (the outputs of convolution and depthwise layers) as INT4 tensors and leaves weights and every other tensor unchanged.
+It stores chosen activation tensors as INT4 and leaves weights and every other tensor unchanged.
+It works on any single-subgraph model and converts only tensors the patched runtime can run; everything else stays int8.
 
 ```sh
 python analysis_scripts/quantization_study/quantization_study.py export-int4-activations \
@@ -98,13 +99,19 @@ python analysis_scripts/quantization_study/quantization_study.py export-int4-act
 - The command measures each chosen tensor on the same calibration clips as the int8 export, with TFLite's built-in kernels.
   It picks a 4-bit range per tensor with `--range-method` (default `mse`), then rescales the biases of the layers that read the tensor.
   Min-max ranges lose far more accuracy at 4 bits than MSE ranges.
-- `--tensors all` converts every feature map the runtime can handle.
-  `--tensors minimal` converts the smallest set with the same estimated memory peak, which keeps the other feature maps at 8 bits and loses less accuracy.
-  Explicit tensor indices (comma-separated) are also accepted.
+- Tensors joined by operators that keep the scale (`PAD`, `RESHAPE`, `EXPAND_DIMS`, max and average pooling) form a group that is converted whole with one set of parameters.
+  For example, a TCN's causal padding and Conv1D reshapes join the convolution output they copy.
+  A group qualifies only if every operator touching it is supported (see the [patch README](../../env_setup/patches/README.md#limits)).
+- `--tensors all` converts every qualifying group.
+  `--tensors minimal` converts the smallest set of groups with the same estimated memory peak, which keeps the rest at 8 bits and loses less accuracy.
+  Explicit tensor indices (comma-separated) convert the groups that contain them.
 - The memory estimate is the largest total of simultaneously live activation tensors, in 16-byte units, with TFLite Micro's tensor lifetimes.
-  It excludes kernel scratch and persistent data, and the planner can fragment.
-  On the medium and large audio models it equalled the planner's activation region exactly, so confirm with the runtime's arena report.
-- The output next to the model, `<output>.json`, lists each tensor's int8 and int4 scale and zero point, the clipping range, the estimated peak for int8 and int4, and the input and output hashes.
+  It is a lower bound: it excludes kernel scratch and persistent data, and the greedy planner can fragment.
+  It equalled the planner's activation region on the audio DS-CNNs, but the planner needed up to 39% more on `odom_tcn` models, so confirm with the runtime's arena report.
+- The output next to the model, `<output>.json`, lists each group and tensor with its int8 and int4 scale and zero point and clipping range, every group kept at int8 with the reason, the estimated peak for int8 and int4, warnings, and the input and output hashes.
+- Warnings flag exports that the pinned Arduino runtime computes wrongly even at int8.
+  A model exported with a dynamic batch stores batch 1 in its `SPACE_TO_BATCH_ND` and `BATCH_TO_SPACE_ND` tensors (dilated Conv1D layers), and TensorFlow Lite Micro's outputs are then unrelated to TFLite's.
+  Export from a model with a fixed batch of 1, which also turns those operators into dilated convolutions.
 - Accuracy depends on the calibration sample.
   Across four `--seed` values, the all-feature-map models' test macro-F1 moved by up to 4 points, so compare seeds before drawing conclusions.
 - No stock runtime executes the output, and TensorFlow's interpreter does not either.

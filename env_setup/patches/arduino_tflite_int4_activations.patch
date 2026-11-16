@@ -7,10 +7,9 @@
 # Changes to upstream files remain under their upstream license (Apache-2.0).
 #
 # This preamble is ignored by git apply.
-
 diff -ruN a/src/tensorflow/lite/kernels/kernel_util.cpp b/src/tensorflow/lite/kernels/kernel_util.cpp
 --- a/src/tensorflow/lite/kernels/kernel_util.cpp	2024-07-05 04:37:47.000000000 -0700
-+++ b/src/tensorflow/lite/kernels/kernel_util.cpp	2026-11-15 17:28:35.516561463 -0800
++++ b/src/tensorflow/lite/kernels/kernel_util.cpp	2026-11-15 19:10:15.680289403 -0800
 @@ -234,8 +234,8 @@
    const bool is_per_channel = affine_quantization->scale->size > 1;
    if (is_per_channel) {
@@ -41,43 +40,141 @@ diff -ruN a/src/tensorflow/lite/kernels/kernel_util.cpp b/src/tensorflow/lite/ke
    } else if (output->type == kTfLiteInt16) {
      qmin = std::numeric_limits<int16_t>::min();
      qmax = std::numeric_limits<int16_t>::max();
+diff -ruN a/src/tensorflow/lite/micro/kernels/cmsis_nn/add.cpp b/src/tensorflow/lite/micro/kernels/cmsis_nn/add.cpp
+--- a/src/tensorflow/lite/micro/kernels/cmsis_nn/add.cpp	2024-07-05 04:37:47.000000000 -0700
++++ b/src/tensorflow/lite/micro/kernels/cmsis_nn/add.cpp	2026-11-15 19:10:15.684289242 -0800
+@@ -26,6 +26,8 @@
+ #include "tensorflow/lite/micro/kernels/kernel_util.h"
+ #include "tensorflow/lite/micro/memory_helpers.h"
+ #include "tensorflow/lite/micro/micro_log.h"
++#include "tensorflow/lite/micro/kernels/crest_act4.h"
++#include "tensorflow/lite/micro/micro_utils.h"
+ 
+ namespace tflite {
+ 
+@@ -67,8 +69,8 @@
+                              OpData* data) {
+   data->requires_broadcast = !HaveSameShapes(input1, input2);
+ 
+-  if (output->type == kTfLiteInt8 || output->type == kTfLiteInt16) {
+-    // 8bit -> 8bit general quantized path, with general rescalings
++  if (output->type == kTfLiteInt8 || output->type == kTfLiteInt16 || output->type == kTfLiteInt4) {
++    // 8bit -> 8bit general quantized path, with general rescalings (4-bit tensors use it unchanged)
+     data->input1_offset = -input1->params.zero_point;
+     data->input2_offset = -input2->params.zero_point;
+     data->output_offset = output->params.zero_point;
+@@ -121,6 +123,47 @@
+                       op_params);
+ }
+ 
++// Packed 4-bit operands: unpack 64 values of each input at a time, call the int8 kernel, and pack the result.
++// Inputs and output may each be int8 or packed 4-bit; shapes must match (no broadcasting).
++TfLiteStatus EvalPackedInt4Add(TfLiteContext* context, const tflite::ArithmeticParams& op_params,
++                               const OpData* data, const TfLiteEvalTensor* input1,
++                               const TfLiteEvalTensor* input2, TfLiteEvalTensor* output) {
++  TF_LITE_ENSURE(context, !data->requires_broadcast);
++  const int total = static_cast<int>(ElementCount(*output->dims));
++  TF_LITE_ENSURE_EQ(context, static_cast<int>(ElementCount(*input1->dims)), total);
++  TF_LITE_ENSURE_EQ(context, static_cast<int>(ElementCount(*input2->dims)), total);
++  const bool a4_input1 = input1->type == kTfLiteInt4;
++  const bool a4_input2 = input2->type == kTfLiteInt4;
++  const bool a4_output = output->type == kTfLiteInt4;
++  const int8_t* data1 = tflite::micro::GetTensorData<int8_t>(input1);
++  const int8_t* data2 = tflite::micro::GetTensorData<int8_t>(input2);
++  int8_t* out = tflite::micro::GetTensorData<int8_t>(output);
++  int8_t a[64];
++  int8_t b[64];
++  int8_t c[64];
++  for (int start = 0; start < total; start += 64) {
++    const int n = total - start < 64 ? total - start : 64;
++    const int8_t* x = data1 + start;
++    const int8_t* y = data2 + start;
++    if (a4_input1) {
++      crest_act4::Unpack(data1, total, start, n, a);
++      x = a;
++    }
++    if (a4_input2) {
++      crest_act4::Unpack(data2, total, start, n, b);
++      y = b;
++    }
++    int8_t* z = a4_output ? c : out + start;
++    arm_elementwise_add_s8(x, y, op_params.input1_offset, op_params.input1_multiplier, op_params.input1_shift,
++                           op_params.input2_offset, op_params.input2_multiplier, op_params.input2_shift,
++                           op_params.left_shift, z, op_params.output_offset, op_params.output_multiplier,
++                           op_params.output_shift, op_params.quantized_activation_min,
++                           op_params.quantized_activation_max, n);
++    if (a4_output) crest_act4::Pack(c, total, start, n, out);
++  }
++  return kTfLiteOk;
++}
++
+ TfLiteStatus EvalAddQuantizedInt8(TfLiteContext* context, TfLiteNode* node,
+                                   TfLiteAddParams* params, const OpData* data,
+                                   const TfLiteEvalTensor* input1,
+@@ -129,6 +172,11 @@
+   tflite::ArithmeticParams op_params;
+   UpdateOpParams(&op_params, data);
+ 
++  if ((input1->type == kTfLiteInt4 || input2->type == kTfLiteInt4 || output->type == kTfLiteInt4) &&
++      crest_act4::PackedActivations()) {
++    return EvalPackedInt4Add(context, op_params, data, input1, input2, output);
++  }
++
+   bool need_broadcast = reference_ops::ProcessBroadcastShapes(
+       tflite::micro::GetTensorShape(input1),
+       tflite::micro::GetTensorShape(input2), &op_params);
+@@ -229,8 +277,9 @@
+                               const TfLiteEvalTensor* input2,
+                               TfLiteEvalTensor* output) {
+   switch (output->type) {
++    case kTfLiteInt4:  // container mode stores one value per byte, so the int8 code runs unchanged
+     case kTfLiteInt8: {
+-      EvalAddQuantizedInt8(context, node, params, data, input1, input2, output);
++      TF_LITE_ENSURE_OK(context, EvalAddQuantizedInt8(context, node, params, data, input1, input2, output));
+       break;
+     }
+     case kTfLiteInt16: {
+@@ -304,7 +353,7 @@
+ 
+   if (output->type == kTfLiteFloat32) {
+     EvalAddFloat(context, node, params, data, input1, input2, output);
+-  } else if (output->type == kTfLiteInt8 || output->type == kTfLiteInt16) {
++  } else if (output->type == kTfLiteInt8 || output->type == kTfLiteInt16 || output->type == kTfLiteInt4) {
+     TF_LITE_ENSURE_OK(context, EvalAddQuantized(context, node, params, data,
+                                                 input1, input2, output));
+   } else {
 diff -ruN a/src/tensorflow/lite/micro/kernels/cmsis_nn/conv.cpp b/src/tensorflow/lite/micro/kernels/cmsis_nn/conv.cpp
 --- a/src/tensorflow/lite/micro/kernels/cmsis_nn/conv.cpp	2024-07-05 04:37:47.000000000 -0700
-+++ b/src/tensorflow/lite/micro/kernels/cmsis_nn/conv.cpp	2026-11-15 17:28:35.516561463 -0800
-@@ -28,6 +28,7 @@
++++ b/src/tensorflow/lite/micro/kernels/cmsis_nn/conv.cpp	2026-11-15 19:10:15.684289242 -0800
+@@ -28,6 +28,8 @@
  #include "tensorflow/lite/kernels/padding.h"
  #include "tensorflow/lite/micro/kernels/kernel_util.h"
  #include "tensorflow/lite/micro/micro_log.h"
 +#include "tensorflow/lite/micro/kernels/crest_act4.h"
++#include "tensorflow/lite/micro/micro_utils.h"
  
  namespace tflite {
  namespace {
-@@ -37,8 +38,24 @@
+@@ -37,8 +39,18 @@
  
    // Index to buffer for optimizations if applicable.
    int buffer_idx;
 +
-+  // 4-bit activations in packed mode: per-row tiles in scratch memory.
++  // 4-bit activations in packed mode: tiles in scratch memory (see crest_act4.h).
 +  bool a4_tiled;
 +  int a4_in_tile_idx;
 +  int a4_out_tile_idx;
++  crest_act4::SpatialPlan* a4_plan;  // allocated only for 4-bit operators
  };
  
-+// Input rows needed for one output row of a convolution with dilation 1, clipped to the input.
-+inline void A4RowRange(int out_y, int stride_h, int pad_top, int kernel_h, int input_h, int* first_row,
-+                       int* rows, int* tile_pad) {
-+  const int top = out_y * stride_h - pad_top;
-+  const int first = top < 0 ? 0 : top;
-+  const int last = (top + kernel_h - 1) < (input_h - 1) ? (top + kernel_h - 1) : (input_h - 1);
-+  *first_row = first;
-+  *rows = last - first + 1;
-+  *tile_pad = first - top;
-+}
++// Output lines per tile: one row keeps the scratch smallest at the memory peak; 1-D tensors go 32 columns at a time.
++constexpr int kA4ConvRows = 1;
++constexpr int kA4ConvColumns = 32;
 +
  void* Init(TfLiteContext* context, const char* buffer, size_t length) {
    TFLITE_DCHECK(context->AllocatePersistentBuffer != nullptr);
    return context->AllocatePersistentBuffer(context, sizeof(OpData));
-@@ -98,7 +115,20 @@
+@@ -98,7 +110,19 @@
          context, filter_size, &data->reference_op_data.filter_buffer_index);
    }
  
@@ -91,7 +188,6 @@ diff -ruN a/src/tensorflow/lite/micro/kernels/cmsis_nn/conv.cpp b/src/tensorflow
 +    TF_LITE_ENSURE(context, input->type == kTfLiteInt8 || a4_input);
 +    TF_LITE_ENSURE(context, output->type == kTfLiteInt8 || a4_output);
 +    TF_LITE_ENSURE_EQ(context, filter->type, kTfLiteInt8);
-+    TF_LITE_ENSURE_EQ(context, params.dilation_height_factor, 1);
 +    TF_LITE_ENSURE_EQ(context, input_dims.n, 1);
 +  }
 +
@@ -99,7 +195,7 @@ diff -ruN a/src/tensorflow/lite/micro/kernels/cmsis_nn/conv.cpp b/src/tensorflow
      const int num_channels = filter->dims->data[kConvQuantizedDimension];
      data->reference_op_data.per_channel_output_multiplier =
          static_cast<int32_t*>(context->AllocatePersistentBuffer(
-@@ -113,7 +143,7 @@
+@@ -113,7 +137,7 @@
        filter_dims.h, output_dims.w, output_dims.h, input->type,
        &data->reference_op_data));
  
@@ -108,44 +204,55 @@ diff -ruN a/src/tensorflow/lite/micro/kernels/cmsis_nn/conv.cpp b/src/tensorflow
      // Initialize cmsis_nn convolution parameters
      cmsis_nn_conv_params conv_params;
      conv_params.input_offset = -input->params.zero_point;
-@@ -127,7 +157,30 @@
+@@ -127,7 +151,40 @@
      conv_params.activation.min = data->reference_op_data.output_activation_min;
      conv_params.activation.max = data->reference_op_data.output_activation_max;
  
 -    if (input->type == kTfLiteInt8) {
 +    if (data->a4_tiled) {
-+      // One output row per call: the kernel buffer must fit the largest row tile.
-+      cmsis_nn_dims tile_out = output_dims;
-+      tile_out.h = 1;
-+      for (int out_y = 0; out_y < output_dims.h; ++out_y) {
-+        int first_row, rows, tile_pad;
-+        A4RowRange(out_y, params.stride_height, conv_params.padding.h, filter_dims.h, input_dims.h, &first_row,
-+                   &rows, &tile_pad);
++      // The kernel buffer and the tile buffers must fit the largest tile.
++      data->a4_plan = static_cast<crest_act4::SpatialPlan*>(
++          context->AllocatePersistentBuffer(context, sizeof(crest_act4::SpatialPlan)));
++      TF_LITE_ENSURE(context, data->a4_plan != nullptr);
++      *data->a4_plan = crest_act4::MakeSpatialPlan(
++          input_dims.h, input_dims.w, input_dims.c, output_dims.h, output_dims.w, output_dims.c, filter_dims.h,
++          filter_dims.w, params.stride_height, params.stride_width, params.dilation_height_factor,
++          params.dilation_width_factor, conv_params.padding.h, conv_params.padding.w, kA4ConvRows, kA4ConvColumns);
++      const crest_act4::SpatialPlan& plan = *data->a4_plan;
++      int max_in_lines = 0;
++      int max_out_lines = 0;
++      bool phased = false;
++      const bool tiles_ok = crest_act4::ForEachTile(plan.axis, plan.chunk, a4_input, [&](const crest_act4::Tile& tile) {
 +        cmsis_nn_dims tile_in = input_dims;
-+        tile_in.h = rows;
++        cmsis_nn_dims tile_out = output_dims;
 +        cmsis_nn_conv_params tile_params = conv_params;
-+        tile_params.padding.h = tile_pad;
++        crest_act4::ApplyConvTile(plan, tile, &tile_in, &tile_out, &tile_params);
 +        const int32_t size = arm_convolve_wrapper_s8_get_buffer_size(&tile_params, &tile_in, &filter_dims, &tile_out);
 +        if (size > buf_size) buf_size = size;
-+      }
++        if (tile.in_lines > max_in_lines) max_in_lines = tile.in_lines;
++        if (tile.out_lines > max_out_lines) max_out_lines = tile.out_lines;
++        if (tile.out_step != 1) phased = true;
++      });
++      TF_LITE_ENSURE(context, tiles_ok);
 +      if (a4_input) {
 +        TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
-+            context, filter_dims.h * input_dims.w * input_dims.c, &data->a4_in_tile_idx));
++            context, max_in_lines * plan.in_line, &data->a4_in_tile_idx));
 +      }
-+      if (a4_output) {
++      if (crest_act4::TileNeedsOutputBuffer(a4_output, phased)) {
 +        TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
-+            context, output_dims.w * output_dims.c, &data->a4_out_tile_idx));
++            context, max_out_lines * plan.out_line, &data->a4_out_tile_idx));
 +      }
 +    } else if (input->type == kTfLiteInt8 || a4_input) {
        buf_size = arm_convolve_wrapper_s8_get_buffer_size(
            &conv_params, &input_dims, &filter_dims, &output_dims);
      } else if (input->type == kTfLiteInt16) {
-@@ -252,6 +305,102 @@
+@@ -252,6 +309,94 @@
    return kTfLiteOk;
  }
  
-+// Packed 4-bit activations: unpack the input rows one output row needs, run the int8 kernel on that tile, and
-+// pack the output row. Each output value comes from the same integer arithmetic as the untiled call.
++// Packed 4-bit activations: gather each tile's input lines (unpacking them), run the int8 kernel on the tile, and
++// write its output lines back (packing them). Each output value comes from the same integer arithmetic as the
++// untiled call.
 +TfLiteStatus EvalA4Tiled(TfLiteContext* context, const TfLiteConvParams& params, const OpData& data,
 +                         const TfLiteEvalTensor* input, const TfLiteEvalTensor* filter,
 +                         const TfLiteEvalTensor* bias, TfLiteEvalTensor* output) {
@@ -196,54 +303,45 @@ diff -ruN a/src/tensorflow/lite/micro/kernels/cmsis_nn/conv.cpp b/src/tensorflow
 +
 +  const bool a4_input = input->type == kTfLiteInt4;
 +  const bool a4_output = output->type == kTfLiteInt4;
-+  int8_t* in_tile = a4_input ? static_cast<int8_t*>(context->GetScratchBuffer(context, data.a4_in_tile_idx)) : nullptr;
-+  int8_t* out_tile = a4_output ? static_cast<int8_t*>(context->GetScratchBuffer(context, data.a4_out_tile_idx)) : nullptr;
++  int8_t* in_tile =
++      data.a4_in_tile_idx > -1 ? static_cast<int8_t*>(context->GetScratchBuffer(context, data.a4_in_tile_idx)) : nullptr;
++  int8_t* out_tile =
++      data.a4_out_tile_idx > -1 ? static_cast<int8_t*>(context->GetScratchBuffer(context, data.a4_out_tile_idx)) : nullptr;
 +  const int8_t* input_data = tflite::micro::GetTensorData<int8_t>(input);
 +  int8_t* output_data = tflite::micro::GetTensorData<int8_t>(output);
 +  const int8_t* filter_data = tflite::micro::GetTensorData<int8_t>(filter);
 +  const int32_t* bias_data = tflite::micro::GetOptionalTensorData<int32_t>(bias);
-+  const int input_row = input_dims.w * input_dims.c;
-+  const int output_row = output_dims.w * output_dims.c;
++  const int input_total = static_cast<int>(ElementCount(*input->dims));
++  const int output_total = static_cast<int>(ElementCount(*output->dims));
++  // Zero point -8: feed q - zero_point directly, so the kernel adds no offset (and skips its weight sums).
++  const bool shifted = a4_input && conv_params.input_offset == 8;
++  const crest_act4::SpatialPlan& plan = *data.a4_plan;
 +
-+  cmsis_nn_dims tile_out = output_dims;
-+  tile_out.h = 1;
-+  for (int out_y = 0; out_y < output_dims.h; ++out_y) {
-+    int first_row, rows, tile_pad;
-+    A4RowRange(out_y, conv_params.stride.h, conv_params.padding.h, filter_dims.h, input_dims.h, &first_row, &rows,
-+               &tile_pad);
++  bool ok = true;
++  crest_act4::ForEachTile(plan.axis, plan.chunk, a4_input, [&](const crest_act4::Tile& tile) {
++    if (!ok) return;
 +    cmsis_nn_dims tile_in = input_dims;
-+    tile_in.h = rows;
++    cmsis_nn_dims tile_out = output_dims;
 +    cmsis_nn_conv_params tile_params = conv_params;
-+    tile_params.padding.h = tile_pad;
-+    const int8_t* source = input_data + first_row * input_row;
-+    if (a4_input) {
-+      if (conv_params.input_offset == 8) {
-+        // Zero point -8: feed q - zero_point directly, so the kernel adds no offset (and skips its weight sums).
-+        crest_act4::UnpackShifted(input_data, first_row * input_row, rows * input_row, in_tile,
-+                                  crest_act4::PlanarLayout(input_row));
-+        tile_params.input_offset = 0;
-+      } else {
-+        crest_act4::Unpack(input_data, first_row * input_row, rows * input_row, in_tile,
-+                           crest_act4::PlanarLayout(input_row));
-+      }
-+      source = in_tile;
-+    }
-+    int8_t* destination = a4_output ? out_tile : output_data + out_y * output_row;
++    crest_act4::ApplyConvTile(plan, tile, &tile_in, &tile_out, &tile_params);
++    if (shifted) tile_params.input_offset = 0;
++    const int8_t* source =
++        crest_act4::GatherTile(tile, plan.in_line, input_data, input_total, a4_input, shifted, in_tile);
++    int8_t* destination = crest_act4::TileOutput(tile, plan.out_line, output_data, a4_output, out_tile);
 +    if (arm_convolve_wrapper_s8(&ctx, &tile_params, &quant_params, &tile_in, source, &filter_dims, filter_data,
 +                                &bias_dims, bias_data, &tile_out, destination) != ARM_CMSIS_NN_SUCCESS) {
-+      return kTfLiteError;
++      ok = false;
++      return;
 +    }
-+    if (a4_output) {
-+      crest_act4::Pack(out_tile, out_y * output_row, output_row, output_data, crest_act4::PlanarLayout(output_row));
-+    }
-+  }
-+  return kTfLiteOk;
++    crest_act4::ScatterTile(tile, plan.out_line, output_data, output_total, a4_output, out_tile);
++  });
++  return ok ? kTfLiteOk : kTfLiteError;
 +}
 +
  TfLiteStatus EvalQuantizedPerChannel16x8(
      TfLiteContext* context, TfLiteNode* node, const TfLiteConvParams& params,
      const OpData& data, const TfLiteEvalTensor* input,
-@@ -410,6 +559,14 @@
+@@ -410,6 +555,14 @@
    TFLITE_DCHECK(node->user_data != nullptr);
    const OpData& data = *(static_cast<const OpData*>(node->user_data));
  
@@ -260,46 +358,37 @@ diff -ruN a/src/tensorflow/lite/micro/kernels/cmsis_nn/conv.cpp b/src/tensorflow
        context,
 diff -ruN a/src/tensorflow/lite/micro/kernels/cmsis_nn/depthwise_conv.cpp b/src/tensorflow/lite/micro/kernels/cmsis_nn/depthwise_conv.cpp
 --- a/src/tensorflow/lite/micro/kernels/cmsis_nn/depthwise_conv.cpp	2024-07-05 04:37:47.000000000 -0700
-+++ b/src/tensorflow/lite/micro/kernels/cmsis_nn/depthwise_conv.cpp	2026-11-15 17:28:35.516561463 -0800
-@@ -28,6 +28,7 @@
++++ b/src/tensorflow/lite/micro/kernels/cmsis_nn/depthwise_conv.cpp	2026-11-15 19:10:15.684289242 -0800
+@@ -28,6 +28,8 @@
  #include "tensorflow/lite/micro/kernels/conv.h"
  #include "tensorflow/lite/micro/kernels/kernel_util.h"
  #include "tensorflow/lite/micro/micro_log.h"
 +#include "tensorflow/lite/micro/kernels/crest_act4.h"
++#include "tensorflow/lite/micro/micro_utils.h"
  
  namespace tflite {
  namespace {
-@@ -37,8 +38,29 @@
+@@ -37,8 +39,19 @@
  
    // Index to buffer for optimizations if applicable.
    int buffer_idx;
 +
-+  // 4-bit activations in packed mode: per-row tiles in scratch memory.
++  // 4-bit activations in packed mode: tiles in scratch memory (see crest_act4.h).
 +  bool a4_tiled;
 +  int a4_in_tile_idx;
 +  int a4_out_tile_idx;
++  crest_act4::SpatialPlan* a4_plan;  // allocated only for 4-bit operators
  };
  
-+// Output rows per depthwise tile. A tile of R output rows needs (R - 1) * stride + kernel_h input rows, so
++// Output lines per depthwise tile. A tile of R output rows needs (R - 1) * stride + kernel_h input rows, so
 +// larger tiles unpack each input row fewer times but take more scratch memory.
 +constexpr int kA4DepthwiseRows = 4;
-+
-+// Input rows needed for output rows [out_y, out_y + out_rows) with dilation 1, clipped to the input.
-+inline void A4RowRange(int out_y, int out_rows, int stride_h, int pad_top, int kernel_h, int input_h,
-+                       int* first_row, int* rows, int* tile_pad) {
-+  const int top = out_y * stride_h - pad_top;
-+  const int bottom = (out_y + out_rows - 1) * stride_h - pad_top + kernel_h - 1;
-+  const int first = top < 0 ? 0 : top;
-+  const int last = bottom < (input_h - 1) ? bottom : (input_h - 1);
-+  *first_row = first;
-+  *rows = last - first + 1;
-+  *tile_pad = first - top;
-+}
++constexpr int kA4DepthwiseColumns = 32;
 +
  // Always inline for optimal code size.
  void PopulateDwConvParams(
      cmsis_nn_dw_conv_params* const dw_conv_params,
-@@ -83,7 +105,19 @@
+@@ -83,7 +96,18 @@
    int output_width = SizeOfDimension(output, 2);
    int output_height = SizeOfDimension(output, 1);
  
@@ -313,14 +402,13 @@ diff -ruN a/src/tensorflow/lite/micro/kernels/cmsis_nn/depthwise_conv.cpp b/src/
 +    TF_LITE_ENSURE(context, input->type == kTfLiteInt8 || a4_input);
 +    TF_LITE_ENSURE(context, output->type == kTfLiteInt8 || a4_output);
 +    TF_LITE_ENSURE_EQ(context, filter->type, kTfLiteInt8);
-+    TF_LITE_ENSURE_EQ(context, params.dilation_height_factor, 1);
 +  }
 +
 +  if (input->type == kTfLiteInt8 || input->type == kTfLiteInt16 || a4_input) {
      TF_LITE_ENSURE_EQ(context, filter->quantization.type,
                        kTfLiteAffineQuantization);
  
-@@ -132,7 +166,7 @@
+@@ -132,7 +156,7 @@
        filter_height, output_width, output_height, data_type,
        &data->reference_op_data));
  
@@ -329,7 +417,7 @@ diff -ruN a/src/tensorflow/lite/micro/kernels/cmsis_nn/depthwise_conv.cpp b/src/
      RuntimeShape input_shape = GetTensorShape(input);
      RuntimeShape output_shape = GetTensorShape(output);
      RuntimeShape filter_shape = GetTensorShape(filter);
-@@ -168,8 +202,38 @@
+@@ -168,8 +192,48 @@
      dw_conv_params.dilation.h = params.dilation_height_factor;
      dw_conv_params.dilation.w = params.dilation_width_factor;
  
@@ -337,31 +425,41 @@ diff -ruN a/src/tensorflow/lite/micro/kernels/cmsis_nn/depthwise_conv.cpp b/src/
 -        &dw_conv_params, &input_dims, &filter_dims, &output_dims);
 +    int32_t buf_size = 0;
 +    if (data->a4_tiled) {
-+      // One output row per call: the kernel buffer must fit the largest row tile.
-+      int max_rows = 0;
-+      for (int out_y = 0; out_y < output_height; out_y += kA4DepthwiseRows) {
-+        cmsis_nn_dims tile_out = output_dims;
-+        tile_out.h = output_height - out_y < kA4DepthwiseRows ? output_height - out_y : kA4DepthwiseRows;
-+        int first_row, rows, tile_pad;
-+        A4RowRange(out_y, tile_out.h, params.stride_height, dw_conv_params.padding.h, filter_height, input_height,
-+                   &first_row, &rows, &tile_pad);
-+        if (rows > max_rows) max_rows = rows;
++      // The kernel buffer and the tile buffers must fit the largest tile.
++      dw_conv_params.stride.h = params.stride_height;
++      dw_conv_params.stride.w = params.stride_width;
++      data->a4_plan = static_cast<crest_act4::SpatialPlan*>(
++          context->AllocatePersistentBuffer(context, sizeof(crest_act4::SpatialPlan)));
++      TF_LITE_ENSURE(context, data->a4_plan != nullptr);
++      *data->a4_plan = crest_act4::MakeSpatialPlan(
++          input_height, input_width, input_dims.c, output_height, output_width, output_depth, filter_height,
++          filter_width, params.stride_height, params.stride_width, params.dilation_height_factor,
++          params.dilation_width_factor, dw_conv_params.padding.h, dw_conv_params.padding.w, kA4DepthwiseRows,
++          kA4DepthwiseColumns);
++      const crest_act4::SpatialPlan& plan = *data->a4_plan;
++      int max_in_lines = 0;
++      int max_out_lines = 0;
++      bool phased = false;
++      const bool tiles_ok = crest_act4::ForEachTile(plan.axis, plan.chunk, a4_input, [&](const crest_act4::Tile& tile) {
 +        cmsis_nn_dims tile_in = input_dims;
-+        tile_in.h = rows;
++        cmsis_nn_dims tile_out = output_dims;
 +        cmsis_nn_dw_conv_params tile_params = dw_conv_params;
-+        tile_params.padding.h = tile_pad;
++        crest_act4::ApplyConvTile(plan, tile, &tile_in, &tile_out, &tile_params);
 +        const int32_t size =
 +            arm_depthwise_conv_wrapper_s8_get_buffer_size(&tile_params, &tile_in, &filter_dims, &tile_out);
 +        if (size > buf_size) buf_size = size;
-+      }
++        if (tile.in_lines > max_in_lines) max_in_lines = tile.in_lines;
++        if (tile.out_lines > max_out_lines) max_out_lines = tile.out_lines;
++        if (tile.out_step != 1) phased = true;
++      });
++      TF_LITE_ENSURE(context, tiles_ok);
 +      if (a4_input) {
 +        TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
-+            context, max_rows * input_width * input_dims.c, &data->a4_in_tile_idx));
++            context, max_in_lines * plan.in_line, &data->a4_in_tile_idx));
 +      }
-+      if (a4_output) {
-+        const int out_rows = output_height < kA4DepthwiseRows ? output_height : kA4DepthwiseRows;
++      if (crest_act4::TileNeedsOutputBuffer(a4_output, phased)) {
 +        TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
-+            context, out_rows * output_width * output_depth, &data->a4_out_tile_idx));
++            context, max_out_lines * plan.out_line, &data->a4_out_tile_idx));
 +      }
 +    } else {
 +      buf_size = arm_depthwise_conv_wrapper_s8_get_buffer_size(
@@ -370,12 +468,13 @@ diff -ruN a/src/tensorflow/lite/micro/kernels/cmsis_nn/depthwise_conv.cpp b/src/
  
      if (buf_size > 0) {
        TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
-@@ -285,6 +349,71 @@
+@@ -285,6 +349,62 @@
        ARM_CMSIS_NN_SUCCESS);
  }
  
-+// Packed 4-bit activations: unpack the input rows one output row needs, run the int8 kernel on that tile, and
-+// pack the output row. Each output value comes from the same integer arithmetic as the untiled call.
++// Packed 4-bit activations: gather each tile's input lines (unpacking them), run the int8 kernel on the tile, and
++// write its output lines back (packing them). Each output value comes from the same integer arithmetic as the
++// untiled call.
 +TfLiteStatus EvalA4Tiled(TfLiteContext* context, TfLiteNode* node, const TfLiteDepthwiseConvParams& params,
 +                         const OpData& data, const TfLiteEvalTensor* input, const TfLiteEvalTensor* filter,
 +                         const TfLiteEvalTensor* bias, TfLiteEvalTensor* output) {
@@ -394,55 +493,45 @@ diff -ruN a/src/tensorflow/lite/micro/kernels/cmsis_nn/depthwise_conv.cpp b/src/
 +
 +  const bool a4_input = input->type == kTfLiteInt4;
 +  const bool a4_output = output->type == kTfLiteInt4;
-+  int8_t* in_tile = a4_input ? static_cast<int8_t*>(context->GetScratchBuffer(context, data.a4_in_tile_idx)) : nullptr;
-+  int8_t* out_tile = a4_output ? static_cast<int8_t*>(context->GetScratchBuffer(context, data.a4_out_tile_idx)) : nullptr;
++  int8_t* in_tile =
++      data.a4_in_tile_idx > -1 ? static_cast<int8_t*>(context->GetScratchBuffer(context, data.a4_in_tile_idx)) : nullptr;
++  int8_t* out_tile =
++      data.a4_out_tile_idx > -1 ? static_cast<int8_t*>(context->GetScratchBuffer(context, data.a4_out_tile_idx)) : nullptr;
 +  const int8_t* input_data = tflite::micro::GetTensorData<int8_t>(input);
 +  int8_t* output_data = tflite::micro::GetTensorData<int8_t>(output);
 +  const int8_t* filter_data = tflite::micro::GetTensorData<int8_t>(filter);
 +  const int32_t* bias_data = tflite::micro::GetOptionalTensorData<int32_t>(bias);
-+  const int input_row = input_dims.w * input_dims.c;
-+  const int output_row = output_dims.w * output_dims.c;
++  const int input_total = static_cast<int>(ElementCount(*input->dims));
++  const int output_total = static_cast<int>(ElementCount(*output->dims));
++  // Zero point -8: feed q - zero_point directly, so the kernel adds no offset (padding still counts as 0).
++  const bool shifted = a4_input && dw_conv_params.input_offset == 8;
++  const crest_act4::SpatialPlan& plan = *data.a4_plan;
 +
-+  for (int out_y = 0; out_y < output_dims.h; out_y += kA4DepthwiseRows) {
-+    cmsis_nn_dims tile_out = output_dims;
-+    tile_out.h = output_dims.h - out_y < kA4DepthwiseRows ? output_dims.h - out_y : kA4DepthwiseRows;
-+    int first_row, rows, tile_pad;
-+    A4RowRange(out_y, tile_out.h, dw_conv_params.stride.h, dw_conv_params.padding.h, filter_dims.h, input_dims.h,
-+               &first_row, &rows, &tile_pad);
++  bool ok = true;
++  crest_act4::ForEachTile(plan.axis, plan.chunk, a4_input, [&](const crest_act4::Tile& tile) {
++    if (!ok) return;
 +    cmsis_nn_dims tile_in = input_dims;
-+    tile_in.h = rows;
++    cmsis_nn_dims tile_out = output_dims;
 +    cmsis_nn_dw_conv_params tile_params = dw_conv_params;
-+    tile_params.padding.h = tile_pad;
-+    const int8_t* source = input_data + first_row * input_row;
-+    if (a4_input) {
-+      if (dw_conv_params.input_offset == 8) {
-+        // Zero point -8: feed q - zero_point directly, so the kernel adds no offset (padding still counts as 0).
-+        crest_act4::UnpackShifted(input_data, first_row * input_row, rows * input_row, in_tile,
-+                                  crest_act4::PlanarLayout(input_row));
-+        tile_params.input_offset = 0;
-+      } else {
-+        crest_act4::Unpack(input_data, first_row * input_row, rows * input_row, in_tile,
-+                           crest_act4::PlanarLayout(input_row));
-+      }
-+      source = in_tile;
-+    }
-+    int8_t* destination = a4_output ? out_tile : output_data + out_y * output_row;
++    crest_act4::ApplyConvTile(plan, tile, &tile_in, &tile_out, &tile_params);
++    if (shifted) tile_params.input_offset = 0;
++    const int8_t* source =
++        crest_act4::GatherTile(tile, plan.in_line, input_data, input_total, a4_input, shifted, in_tile);
++    int8_t* destination = crest_act4::TileOutput(tile, plan.out_line, output_data, a4_output, out_tile);
 +    if (arm_depthwise_conv_wrapper_s8(&ctx, &tile_params, &quant_params, &tile_in, source, &filter_dims, filter_data,
 +                                      &bias_dims, bias_data, &tile_out, destination) != ARM_CMSIS_NN_SUCCESS) {
-+      return kTfLiteError;
++      ok = false;
++      return;
 +    }
-+    if (a4_output) {
-+      crest_act4::Pack(out_tile, out_y * output_row, tile_out.h * output_row, output_data,
-+                       crest_act4::PlanarLayout(output_row));
-+    }
-+  }
-+  return kTfLiteOk;
++    crest_act4::ScatterTile(tile, plan.out_line, output_data, output_total, a4_output, out_tile);
++  });
++  return ok ? kTfLiteOk : kTfLiteError;
 +}
 +
  void EvalQuantizedPerChannel16x8(TfLiteContext* context, TfLiteNode* node,
                                   const TfLiteDepthwiseConvParams& params,
                                   const OpData& data,
-@@ -337,6 +466,15 @@
+@@ -337,6 +457,15 @@
            ? tflite::micro::GetEvalInput(context, node, kDepthwiseConvBiasTensor)
            : nullptr;
  
@@ -458,14 +547,249 @@ diff -ruN a/src/tensorflow/lite/micro/kernels/cmsis_nn/depthwise_conv.cpp b/src/
    switch (input->type) {  // Already know in/out types are same.
      case kTfLiteFloat32: {
        tflite::reference_ops::DepthwiseConv(
+diff -ruN a/src/tensorflow/lite/micro/kernels/cmsis_nn/pooling.cpp b/src/tensorflow/lite/micro/kernels/cmsis_nn/pooling.cpp
+--- a/src/tensorflow/lite/micro/kernels/cmsis_nn/pooling.cpp	2024-07-05 04:37:47.000000000 -0700
++++ b/src/tensorflow/lite/micro/kernels/cmsis_nn/pooling.cpp	2026-11-15 19:10:15.684289242 -0800
+@@ -22,6 +22,8 @@
+ #include "tensorflow/lite/micro/kernels/kernel_util.h"
+ #include "tensorflow/lite/micro/kernels/pooling.h"
+ #include "tensorflow/lite/micro/micro_log.h"
++#include "tensorflow/lite/micro/kernels/crest_act4.h"
++#include "tensorflow/lite/micro/micro_utils.h"
+ 
+ namespace tflite {
+ 
+@@ -32,13 +34,22 @@
+ 
+   // Index to buffer for optimizations if applicable.
+   int buffer_idx;
++
++  // 4-bit activations in packed mode: tiles in scratch memory (see crest_act4.h).
++  crest_act4::SpatialPlan* a4_plan;
++  int a4_in_tile_idx;
++  int a4_out_tile_idx;
+ };
+ 
++// Output lines per pooling tile.
++constexpr int kA4PoolRows = 2;
++constexpr int kA4PoolColumns = 32;
++
+ void AverageEvalQuantized(TfLiteContext* context, const TfLiteNode* node,
+                           const TfLitePoolParams* params, const OpData& data,
+                           const TfLiteEvalTensor* input,
+                           TfLiteEvalTensor* output) {
+-  TFLITE_DCHECK(input->type == kTfLiteInt8);
++  TFLITE_DCHECK(input->type == kTfLiteInt8 || input->type == kTfLiteInt4);
+ 
+   RuntimeShape input_shape = micro::GetTensorShape(input);
+   TFLITE_DCHECK_EQ(input_shape.DimensionsCount(), 4);
+@@ -138,6 +149,125 @@
+   return kTfLiteOk;
+ }
+ 
++// Packed 4-bit pooling: gather each tile's input lines (unpacking them), run the int8 kernel on the tile, and pack
++// its output lines. Pooling keeps the scale and zero point, so input and output are both 4-bit.
++template <bool kMax>
++TfLiteStatus EvalPackedInt4Pool(TfLiteContext* context, const TfLitePoolParams* params, const OpData& data,
++                                const TfLiteEvalTensor* input, TfLiteEvalTensor* output) {
++  RuntimeShape input_shape = micro::GetTensorShape(input);
++  RuntimeShape output_shape = micro::GetTensorShape(output);
++  const int depth = MatchingDim(input_shape, 3, output_shape, 3);
++
++  cmsis_nn_dims input_dims;
++  input_dims.n = 1;
++  input_dims.h = input_shape.Dims(1);
++  input_dims.w = input_shape.Dims(2);
++  input_dims.c = depth;
++  cmsis_nn_dims output_dims;
++  output_dims.n = 1;
++  output_dims.h = output_shape.Dims(1);
++  output_dims.w = output_shape.Dims(2);
++  output_dims.c = depth;
++  cmsis_nn_dims filter_dims;
++  filter_dims.n = 1;
++  filter_dims.h = params->filter_height;
++  filter_dims.w = params->filter_width;
++  filter_dims.c = 1;
++
++  cmsis_nn_pool_params pool_params;
++  pool_params.stride.h = params->stride_height;
++  pool_params.stride.w = params->stride_width;
++  pool_params.padding.h = data.reference_op_data.padding.height;
++  pool_params.padding.w = data.reference_op_data.padding.width;
++  pool_params.activation.min = data.reference_op_data.activation_min;
++  pool_params.activation.max = data.reference_op_data.activation_max;
++
++  cmsis_nn_context ctx;
++  ctx.buf = data.buffer_idx > -1 ? context->GetScratchBuffer(context, data.buffer_idx) : nullptr;
++  ctx.size = 0;
++  int8_t* in_tile = static_cast<int8_t*>(context->GetScratchBuffer(context, data.a4_in_tile_idx));
++  int8_t* out_tile = static_cast<int8_t*>(context->GetScratchBuffer(context, data.a4_out_tile_idx));
++  const int8_t* input_data = micro::GetTensorData<int8_t>(input);
++  int8_t* output_data = micro::GetTensorData<int8_t>(output);
++  const int input_total = static_cast<int>(ElementCount(*input->dims));
++  const int output_total = static_cast<int>(ElementCount(*output->dims));
++  const crest_act4::SpatialPlan& plan = *data.a4_plan;
++
++  bool ok = true;
++  crest_act4::ForEachTile(plan.axis, plan.chunk, false, [&](const crest_act4::Tile& tile) {
++    if (!ok) return;
++    cmsis_nn_dims tile_in = input_dims;
++    cmsis_nn_dims tile_out = output_dims;
++    cmsis_nn_pool_params tile_params = pool_params;
++    crest_act4::ApplyTileAxis(plan, tile, &tile_in, &tile_out, &tile_params);
++    const int8_t* source = crest_act4::GatherTile(tile, plan.in_line, input_data, input_total, true, false, in_tile);
++    int8_t* destination = crest_act4::TileOutput(tile, plan.out_line, output_data, true, out_tile);
++    const arm_cmsis_nn_status status =
++        kMax ? arm_max_pool_s8(&ctx, &tile_params, &tile_in, source, &filter_dims, &tile_out, destination)
++             : arm_avgpool_s8(&ctx, &tile_params, &tile_in, source, &filter_dims, &tile_out, destination);
++    if (status != ARM_CMSIS_NN_SUCCESS) {
++      ok = false;
++      return;
++    }
++    crest_act4::ScatterTile(tile, plan.out_line, output_data, output_total, true, out_tile);
++  });
++  return ok ? kTfLiteOk : kTfLiteError;
++}
++
++// Plans packed 4-bit pooling tiles and requests their scratch buffers (and average pooling's kernel buffer).
++TfLiteStatus PrepareA4Pool(TfLiteContext* context, TfLiteNode* node, bool average) {
++  MicroContext* micro_context = GetMicroContext(context);
++  TfLiteTensor* input = micro_context->AllocateTempInputTensor(node, kPoolingInputTensor);
++  TfLiteTensor* output = micro_context->AllocateTempOutputTensor(node, kPoolingOutputTensor);
++  TF_LITE_ENSURE(context, input != nullptr && output != nullptr);
++  auto* data = static_cast<OpData*>(node->user_data);
++  data->a4_plan = nullptr;
++  data->a4_in_tile_idx = -1;
++  data->a4_out_tile_idx = -1;
++  if (input->type == kTfLiteInt4) {
++    TF_LITE_ENSURE_EQ(context, output->type, kTfLiteInt4);
++    TF_LITE_ENSURE_EQ(context, input->dims->size, 4);
++    TF_LITE_ENSURE_EQ(context, input->dims->data[0], 1);
++  }
++  if (input->type == kTfLiteInt4 && crest_act4::PackedActivations()) {
++    const auto* params = reinterpret_cast<const TfLitePoolParams*>(node->builtin_data);
++    const int depth = input->dims->data[3];
++    data->a4_plan = static_cast<crest_act4::SpatialPlan*>(
++        context->AllocatePersistentBuffer(context, sizeof(crest_act4::SpatialPlan)));
++    TF_LITE_ENSURE(context, data->a4_plan != nullptr);
++    *data->a4_plan = crest_act4::MakeSpatialPlan(
++        input->dims->data[1], input->dims->data[2], depth, output->dims->data[1], output->dims->data[2], depth,
++        params->filter_height, params->filter_width, params->stride_height, params->stride_width, 1, 1,
++        data->reference_op_data.padding.height, data->reference_op_data.padding.width, kA4PoolRows,
++        kA4PoolColumns);
++    const crest_act4::SpatialPlan& plan = *data->a4_plan;
++    int max_in_lines = 0;
++    int max_out_lines = 0;
++    int32_t buffer_size = 0;
++    const bool tiles_ok = crest_act4::ForEachTile(plan.axis, plan.chunk, false, [&](const crest_act4::Tile& tile) {
++      if (tile.in_lines > max_in_lines) max_in_lines = tile.in_lines;
++      if (tile.out_lines > max_out_lines) max_out_lines = tile.out_lines;
++      if (average) {
++        const int tile_width = plan.along_width ? tile.out_lines : output->dims->data[2];
++        const int32_t size = arm_avgpool_s8_get_buffer_size(tile_width, depth);
++        if (size > buffer_size) buffer_size = size;
++      }
++    });
++    TF_LITE_ENSURE(context, tiles_ok);
++    TF_LITE_ENSURE_STATUS(
++        context->RequestScratchBufferInArena(context, max_in_lines * plan.in_line, &data->a4_in_tile_idx));
++    TF_LITE_ENSURE_STATUS(
++        context->RequestScratchBufferInArena(context, max_out_lines * plan.out_line, &data->a4_out_tile_idx));
++    data->buffer_idx = -1;
++    if (buffer_size > 0) {
++      TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(context, buffer_size, &data->buffer_idx));
++    }
++  }
++  micro_context->DeallocateTempTfLiteTensor(output);
++  micro_context->DeallocateTempTfLiteTensor(input);
++  return kTfLiteOk;
++}
++
+ void* Init(TfLiteContext* context, const char* buffer, size_t length) {
+   TFLITE_DCHECK(context->AllocatePersistentBuffer != nullptr);
+   return context->AllocatePersistentBuffer(context, sizeof(OpData));
+@@ -147,7 +277,7 @@
+   TF_LITE_ENSURE_STATUS(PoolingPrepare(context, node));
+   // Set buffer index to a reset value
+   static_cast<OpData*>(node->user_data)->buffer_idx = -1;
+-  return kTfLiteOk;
++  return PrepareA4Pool(context, node, false);
+ }
+ 
+ TfLiteStatus AveragePrepare(TfLiteContext* context, TfLiteNode* node) {
+@@ -160,7 +290,7 @@
+   TfLiteTensor* output =
+       micro_context->AllocateTempOutputTensor(node, kPoolingOutputTensor);
+ 
+-  if (input->type == kTfLiteInt8) {
++  if (input->type == kTfLiteInt8 || (input->type == kTfLiteInt4 && !crest_act4::PackedActivations())) {
+     RuntimeShape input_shape = GetTensorShape(input);
+     TFLITE_DCHECK_EQ(input_shape.DimensionsCount(), 4);
+ 
+@@ -184,7 +314,7 @@
+ 
+   micro_context->DeallocateTempTfLiteTensor(output);
+   micro_context->DeallocateTempTfLiteTensor(input);
+-  return kTfLiteOk;
++  return PrepareA4Pool(context, node, true);
+ }
+ 
+ TfLiteStatus AverageEval(TfLiteContext* context, TfLiteNode* node) {
+@@ -205,6 +335,12 @@
+       AveragePoolingEvalFloat(context, node, params, &data.reference_op_data,
+                               input, output);
+       break;
++    case kTfLiteInt4:
++      if (crest_act4::PackedActivations()) {
++        return EvalPackedInt4Pool<false>(context, params, data, input, output);
++      }
++      AverageEvalQuantized(context, node, params, data, input, output);
++      break;
+     case kTfLiteInt8:
+       AverageEvalQuantized(context, node, params, data, input, output);
+       break;
+@@ -225,7 +361,7 @@
+ 
+   const TfLiteEvalTensor* input =
+       micro::GetEvalInput(context, node, kPoolingInputTensor);
+-  TFLITE_DCHECK(input->type == kTfLiteInt8);
++  TFLITE_DCHECK(input->type == kTfLiteInt8 || input->type == kTfLiteInt4);
+   TfLiteEvalTensor* output =
+       micro::GetEvalOutput(context, node, kPoolingOutputTensor);
+ 
+@@ -251,6 +387,12 @@
+       MaxPoolingEvalFloat(context, node, params, &data.reference_op_data, input,
+                           output);
+       break;
++    case kTfLiteInt4:
++      if (crest_act4::PackedActivations()) {
++        return EvalPackedInt4Pool<true>(context, params, data, input, output);
++      }
++      MaxEvalInt8(context, node, params, data, input, output);
++      break;
+     case kTfLiteInt8:
+       MaxEvalInt8(context, node, params, data, input, output);
+       break;
+@@ -271,7 +413,7 @@
+ 
+   const TfLiteEvalTensor* input =
+       micro::GetEvalInput(context, node, kPoolingInputTensor);
+-  TFLITE_DCHECK(input->type == kTfLiteInt8);
++  TFLITE_DCHECK(input->type == kTfLiteInt8 || input->type == kTfLiteInt4);
+   TfLiteEvalTensor* output =
+       micro::GetEvalOutput(context, node, kPoolingOutputTensor);
+ 
 diff -ruN a/src/tensorflow/lite/micro/kernels/crest_act4.cpp b/src/tensorflow/lite/micro/kernels/crest_act4.cpp
 --- a/src/tensorflow/lite/micro/kernels/crest_act4.cpp	1969-12-31 16:00:00.000000000 -0800
-+++ b/src/tensorflow/lite/micro/kernels/crest_act4.cpp	2026-11-15 17:28:35.516561463 -0800
-@@ -0,0 +1,108 @@
++++ b/src/tensorflow/lite/micro/kernels/crest_act4.cpp	2026-11-15 19:10:15.684289242 -0800
+@@ -0,0 +1,154 @@
 +// Copyright (c) 2026 UCLA Networked & Embedded Systems Laboratory
 +// SPDX-License-Identifier: BSD-3-Clause
 +// 4-bit activation support for CREST's quantization study; not part of TensorFlow Lite Micro. See crest_act4.h.
 +#include "tensorflow/lite/micro/kernels/crest_act4.h"
++
++#include <cstring>
 +
 +namespace crest_act4 {
 +namespace {
@@ -476,45 +800,56 @@ diff -ruN a/src/tensorflow/lite/micro/kernels/crest_act4.cpp b/src/tensorflow/li
 +bool g_packed = true;
 +#endif
 +
-+// Planar rows always start on a 4-byte boundary of a 16-byte aligned arena buffer.
-+typedef uint32_t __attribute__((may_alias)) Word;
-+
-+inline int8_t Low(uint8_t byte) { return static_cast<int8_t>(static_cast<int8_t>(byte << 4) >> 4); }
-+inline int8_t High(uint8_t byte) { return static_cast<int8_t>(static_cast<int8_t>(byte) >> 4); }
++// Word access without alignment assumptions: Cortex-M4/M7 and x86 allow unaligned 32-bit loads and stores, and
++// the aligned(1) type keeps the compiler from merging them into instructions that do not.
++typedef uint32_t __attribute__((may_alias, aligned(1))) Word;
 +
 +// Sign-extends four 4-bit values held in the low nibbles of four bytes. Each byte's bit 3 is copied into bits 4-7
 +// with one multiply (the four shifted copies never overlap, so nothing carries between bytes).
 +inline uint32_t SignExtendNibbles(uint32_t nibbles) { return nibbles | ((nibbles & 0x08080808u) * 0x1Eu); }
 +
-+void UnpackPairwise(const int8_t* packed, int start, int count, int8_t* out) {
-+  const uint8_t* in = reinterpret_cast<const uint8_t*>(packed) + (start >> 1);
-+  int index = 0;
-+  if ((start & 1) != 0 && count > 0) {
-+    out[index++] = High(*in++);
-+  }
-+  for (; index + 1 < count; index += 2) {
-+    const uint8_t byte = *in++;
-+    out[index] = Low(byte);
-+    out[index + 1] = High(byte);
-+  }
-+  if (index < count) {
-+    out[index] = Low(*in);
++inline void Locate(int total, int index, int* byte, int* high) {
++  const int full = total & ~7;
++  if (index < full) {
++    *byte = ((index >> 3) << 2) | (index & 3);
++    *high = (index >> 2) & 1;
++  } else {
++    const int k = index - full;
++    *byte = (full >> 1) + (k >> 1);
++    *high = k & 1;
 +  }
 +}
 +
-+void PackPairwise(const int8_t* values, int start, int count, int8_t* packed) {
-+  uint8_t* out = reinterpret_cast<uint8_t*>(packed) + (start >> 1);
-+  int index = 0;
-+  if ((start & 1) != 0 && count > 0) {
-+    *out = static_cast<uint8_t>((*out & 0x0F) | (static_cast<uint8_t>(values[index++]) << 4));
-+    ++out;
++// Number of whole 8-value groups that start at `start` (a multiple of 8), fit in `count`, and are full groups.
++inline int WholeGroups(int total, int start, int count) {
++  const int full = total & ~7;
++  if (start >= full) return 0;
++  return MinInt(count >> 3, (full - start) >> 3);
++}
++
++template <bool kShifted>
++void UnpackImpl(const int8_t* packed, int total, int start, int count, int8_t* out) {
++  int i = 0;
++  for (; i < count && ((start + i) & 7) != 0; ++i) {
++    out[i] = static_cast<int8_t>(GetValue(packed, total, start + i) + (kShifted ? 8 : 0));
 +  }
-+  for (; index + 1 < count; index += 2) {
-+    *out++ = static_cast<uint8_t>((static_cast<uint8_t>(values[index]) & 0x0F) |
-+                                  (static_cast<uint8_t>(values[index + 1]) << 4));
++  const int groups = i < count ? WholeGroups(total, start + i, count - i) : 0;
++  const Word* in = reinterpret_cast<const Word*>(packed + ((start + i) >> 1));
++  Word* destination = reinterpret_cast<Word*>(out + i);
++  for (int g = 0; g < groups; ++g) {
++    const uint32_t word = in[g];
++    if (kShifted) {
++      // A 4-bit two's complement nibble n holds q; q + 8 is n with bit 3 flipped.
++      destination[2 * g] = (word & 0x0F0F0F0Fu) ^ 0x08080808u;
++      destination[2 * g + 1] = ((word >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
++    } else {
++      destination[2 * g] = SignExtendNibbles(word & 0x0F0F0F0Fu);
++      destination[2 * g + 1] = SignExtendNibbles((word >> 4) & 0x0F0F0F0Fu);
++    }
 +  }
-+  if (index < count) {
-+    *out = static_cast<uint8_t>((*out & 0xF0) | (static_cast<uint8_t>(values[index]) & 0x0F));
++  i += groups * 8;
++  for (; i < count; ++i) {
++    out[i] = static_cast<int8_t>(GetValue(packed, total, start + i) + (kShifted ? 8 : 0));
 +  }
 +}
 +
@@ -524,71 +859,104 @@ diff -ruN a/src/tensorflow/lite/micro/kernels/crest_act4.cpp b/src/tensorflow/li
 +
 +void SetPackedActivations(bool packed) { g_packed = packed; }
 +
-+void Unpack(const int8_t* packed, int start, int count, int8_t* out, bool planar) {
-+  if (!planar) {
-+    UnpackPairwise(packed, start, count, out);
-+    return;
-+  }
-+  const Word* in = reinterpret_cast<const Word*>(packed + (start >> 1));
-+  Word* destination = reinterpret_cast<Word*>(out);
-+  for (int group = count >> 3; group > 0; --group) {
-+    const uint32_t word = *in++;
-+    destination[0] = SignExtendNibbles(word & 0x0F0F0F0Fu);
-+    destination[1] = SignExtendNibbles((word >> 4) & 0x0F0F0F0Fu);
-+    destination += 2;
-+  }
++int8_t GetValue(const int8_t* packed, int total, int index) {
++  int byte, high;
++  Locate(total, index, &byte, &high);
++  const int8_t value = packed[byte];
++  return high ? static_cast<int8_t>(value >> 4) : static_cast<int8_t>(static_cast<int8_t>(value << 4) >> 4);
 +}
 +
-+void UnpackShifted(const int8_t* packed, int start, int count, int8_t* out, bool planar) {
-+  if (!planar) {
-+    UnpackPairwise(packed, start, count, out);
-+    for (int index = 0; index < count; ++index) out[index] = static_cast<int8_t>(out[index] + 8);
-+    return;
-+  }
-+  const Word* in = reinterpret_cast<const Word*>(packed + (start >> 1));
-+  Word* destination = reinterpret_cast<Word*>(out);
-+  for (int group = count >> 3; group > 0; --group) {
-+    const uint32_t word = *in++;
-+    // A 4-bit two's complement nibble n holds q; q + 8 is n with bit 3 flipped.
-+    destination[0] = (word & 0x0F0F0F0Fu) ^ 0x08080808u;
-+    destination[1] = ((word >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
-+    destination += 2;
-+  }
++void SetValue(int8_t* packed, int total, int index, int8_t value) {
++  int byte, high;
++  Locate(total, index, &byte, &high);
++  uint8_t* target = reinterpret_cast<uint8_t*>(packed) + byte;
++  const uint8_t nibble = static_cast<uint8_t>(value) & 0x0F;
++  *target = high ? static_cast<uint8_t>((*target & 0x0F) | (nibble << 4))
++                 : static_cast<uint8_t>((*target & 0xF0) | nibble);
 +}
 +
-+void Pack(const int8_t* values, int start, int count, int8_t* packed, bool planar) {
-+  if (!planar) {
-+    PackPairwise(values, start, count, packed);
++void Unpack(const int8_t* packed, int total, int start, int count, int8_t* out) {
++  UnpackImpl<false>(packed, total, start, count, out);
++}
++
++void UnpackShifted(const int8_t* packed, int total, int start, int count, int8_t* out) {
++  UnpackImpl<true>(packed, total, start, count, out);
++}
++
++void Pack(const int8_t* values, int total, int start, int count, int8_t* packed) {
++  int i = 0;
++  for (; i < count && ((start + i) & 7) != 0; ++i) SetValue(packed, total, start + i, values[i]);
++  const int groups = i < count ? WholeGroups(total, start + i, count - i) : 0;
++  const Word* source = reinterpret_cast<const Word*>(values + i);
++  Word* out = reinterpret_cast<Word*>(packed + ((start + i) >> 1));
++  for (int g = 0; g < groups; ++g) {
++    out[g] = (source[2 * g] & 0x0F0F0F0Fu) | ((source[2 * g + 1] & 0x0F0F0F0Fu) << 4);
++  }
++  i += groups * 8;
++  for (; i < count; ++i) SetValue(packed, total, start + i, values[i]);
++}
++
++const int8_t* GatherTile(const Tile& tile, int line, const int8_t* data, int total, bool packed, bool shifted,
++                         int8_t* buffer) {
++  if (!packed) {
++    if (tile.in_step == 1) return data + tile.in_first * line;
++    for (int t = 0; t < tile.in_lines; ++t) {
++      memcpy(buffer + t * line, data + (tile.in_first + t * tile.in_step) * line, line);
++    }
++    return buffer;
++  }
++  if (tile.in_step == 1) {
++    (shifted ? UnpackShifted : Unpack)(data, total, tile.in_first * line, tile.in_lines * line, buffer);
++    return buffer;
++  }
++  for (int t = 0; t < tile.in_lines; ++t) {
++    (shifted ? UnpackShifted : Unpack)(data, total, (tile.in_first + t * tile.in_step) * line, line,
++                                       buffer + t * line);
++  }
++  return buffer;
++}
++
++int8_t* TileOutput(const Tile& tile, int line, int8_t* data, bool packed, int8_t* buffer) {
++  if (!packed && tile.out_step == 1) return data + tile.out_first * line;
++  return buffer;
++}
++
++void ScatterTile(const Tile& tile, int line, int8_t* data, int total, bool packed, const int8_t* buffer) {
++  if (!packed && tile.out_step == 1) return;
++  if (tile.out_step == 1) {
++    Pack(buffer, total, tile.out_first * line, tile.out_lines * line, data);
 +    return;
 +  }
-+  const Word* source = reinterpret_cast<const Word*>(values);
-+  Word* out = reinterpret_cast<Word*>(packed + (start >> 1));
-+  for (int group = count >> 3; group > 0; --group) {
-+    *out++ = (source[0] & 0x0F0F0F0Fu) | ((source[1] & 0x0F0F0F0Fu) << 4);
-+    source += 2;
++  for (int t = 0; t < tile.out_lines; ++t) {
++    const int destination = (tile.out_first + t * tile.out_step) * line;
++    if (packed) {
++      Pack(buffer + t * line, total, destination, line, data);
++    } else {
++      memcpy(data + destination, buffer + t * line, line);
++    }
 +  }
 +}
 +
 +}  // namespace crest_act4
 diff -ruN a/src/tensorflow/lite/micro/kernels/crest_act4.h b/src/tensorflow/lite/micro/kernels/crest_act4.h
 --- a/src/tensorflow/lite/micro/kernels/crest_act4.h	1969-12-31 16:00:00.000000000 -0800
-+++ b/src/tensorflow/lite/micro/kernels/crest_act4.h	2026-11-15 17:28:35.520561393 -0800
-@@ -0,0 +1,42 @@
++++ b/src/tensorflow/lite/micro/kernels/crest_act4.h	2026-11-15 19:10:15.684289242 -0800
+@@ -0,0 +1,191 @@
 +// Copyright (c) 2026 UCLA Networked & Embedded Systems Laboratory
 +// SPDX-License-Identifier: BSD-3-Clause
 +// 4-bit activation support for CREST's quantization study; not part of TensorFlow Lite Micro.
 +//
 +// Activation tensors with type kTfLiteInt4 hold values in [-8, 7] with their own scale and zero point.
 +// In packed mode (the default) they are stored two values per byte and the memory planner reserves half a byte
-+// per element. Convolution kernels unpack a tile of input rows into a small scratch buffer, run the unchanged
-+// CMSIS-NN int8 kernel on it, and pack the output rows back, so the arithmetic is exactly the int8 kernel's.
++// per element. Kernels unpack a tile of their input into a small scratch buffer, run the unchanged int8 kernel on
++// it, and pack the output back, so the arithmetic is exactly the int8 kernel's.
 +// In container mode the same tensors are stored one value per byte; it exists to check packed mode bit for bit.
 +//
-+// Packed layout. Activation bytes never leave the runtime, so the layout is chosen for cheap unpacking:
-+// - "planar8", used when a tensor row (W * C elements) is a multiple of 8: elements 8g..8g+3 sit in the low
-+//   nibbles of bytes 4g..4g+3 and elements 8g+4..8g+7 in their high nibbles, so one 32-bit word unpacks to two
-+//   words with a few masks;
-+// - "pairwise" otherwise (TFLite's INT4 weight layout): element 2i in the low nibble of byte i, 2i+1 in the high.
++// Packed layout. Activation bytes never leave the runtime, so the layout is chosen for cheap unpacking, and it
++// depends only on an element's flat index, so a reshape is a byte copy. For a tensor of N values, each full group
++// of 8 values (elements 8g..8g+7) takes bytes 4g..4g+3: elements 8g..8g+3 in the low nibbles and 8g+4..8g+7 in
++// the high nibbles, so one 32-bit word unpacks to two words with a few masks. The last N % 8 values follow
++// two per byte, the even one in the low nibble.
 +#ifndef TENSORFLOW_LITE_MICRO_KERNELS_CREST_ACT4_H_
 +#define TENSORFLOW_LITE_MICRO_KERNELS_CREST_ACT4_H_
 +
@@ -599,26 +967,342 @@ diff -ruN a/src/tensorflow/lite/micro/kernels/crest_act4.h b/src/tensorflow/lite
 +bool PackedActivations();
 +void SetPackedActivations(bool packed);
 +
-+// Layout of a packed tensor whose rows hold `row_elements` values.
-+inline bool PlanarLayout(int row_elements) { return (row_elements % 8) == 0; }
++// Bytes a packed tensor of `total` values occupies.
++inline int PackedBytes(int total) { return (total + 1) / 2; }
 +
-+// Unpacks `count` values starting at element `start` into sign-extended int8 values.
-+// With the planar layout, `start` and `count` must be multiples of 8 (whole rows always are).
-+void Unpack(const int8_t* packed, int start, int count, int8_t* out, bool planar);
++// One value of a packed tensor of `total` values.
++int8_t GetValue(const int8_t* packed, int total, int index);
++void SetValue(int8_t* packed, int total, int index, int8_t value);
++
++// Copies values [start, start + count) of a packed tensor of `total` values into int8 `out`.
++void Unpack(const int8_t* packed, int total, int start, int count, int8_t* out);
 +
 +// Like Unpack, but returns q + 8 (in [0, 15]) instead of q: for a tensor with zero point -8 that is q minus its
 +// zero point, so a kernel can take it with an input offset of 0. It is also cheaper (no sign extension).
-+void UnpackShifted(const int8_t* packed, int start, int count, int8_t* out, bool planar);
++void UnpackShifted(const int8_t* packed, int total, int start, int count, int8_t* out);
 +
-+// Packs `count` int8 values (each already in [-8, 7]) starting at element `start`. Same rules as Unpack.
-+void Pack(const int8_t* values, int start, int count, int8_t* packed, bool planar);
++// Stores int8 values (each already in [-8, 7]) as values [start, start + count) of a packed tensor.
++void Pack(const int8_t* values, int total, int start, int count, int8_t* packed);
++
++// ---------------------------------------------------------------------------------------------------------------
++// Tiling along one spatial axis, shared by convolution, depthwise convolution, and pooling.
++//
++// A "line" is one step along the tiled axis: a row (W * C values) when tiling along height, or one column (C
++// values) when the tensor has height 1 and tiling goes along width. A tile is a run of output lines plus the
++// input lines they read. Kernels gather a tile's input lines into scratch, call the int8 kernel on the tile, and
++// write the output lines back.
++//
++// With a packed input and dilation d > 1 at stride 1, tiles follow the dilation's phases: output lines o with
++// (o - pad) % d == r read only input lines congruent to r, so gathering every d-th line turns the tile into a
++// dense convolution with dilation 1. Otherwise one output line's receptive field spans (kernel - 1) * d + 1
++// input lines, and a TCN layer with d = 64 would unpack nearly its whole input.
++
++struct Axis {
++  int in_lines;
++  int out_lines;
++  int kernel;
++  int stride;
++  int dilation;
++  int pad;  // padding before the first input line
++};
++
++struct Tile {
++  int in_first;   // input line of tile line 0
++  int in_step;    // input lines between consecutive tile lines
++  int in_lines;   // input lines in the tile
++  int tile_pad;   // padding lines before the tile, as the int8 kernel must see it
++  int out_first;  // output line of tile output line 0
++  int out_step;   // output lines between consecutive tile output lines
++  int out_lines;  // output lines in the tile
++  int stride;     // stride the int8 kernel sees along the axis
++  int dilation;   // dilation the int8 kernel sees along the axis
++};
++
++inline int MinInt(int a, int b) { return a < b ? a : b; }
++inline int MaxInt(int a, int b) { return a > b ? a : b; }
++
++// Calls f(tile) for every tile of up to `chunk` output lines. Returns false when a tile would read no input line,
++// which a valid convolution or pooling never needs.
++template <typename F>
++bool ForEachTile(const Axis& a, int chunk, bool phased, F&& f) {
++  if (chunk < 1) chunk = 1;
++  if (!(phased && a.stride == 1 && a.dilation > 1)) {
++    for (int o0 = 0; o0 < a.out_lines; o0 += chunk) {
++      const int o1 = MinInt(o0 + chunk, a.out_lines);
++      const int top = o0 * a.stride - a.pad;
++      const int bottom = (o1 - 1) * a.stride - a.pad + (a.kernel - 1) * a.dilation;
++      const int first = MaxInt(top, 0);
++      const int last = MinInt(bottom, a.in_lines - 1);
++      if (last < first) return false;
++      const Tile tile = {first, 1, last - first + 1, first - top, o0, 1, o1 - o0, a.stride, a.dilation};
++      f(tile);
++    }
++    return true;
++  }
++  const int d = a.dilation;
++  for (int r = 0; r < d; ++r) {
++    const int o_first = ((r + a.pad) % d + d) % d;
++    if (o_first >= a.out_lines) continue;
++    const int count = (a.out_lines - 1 - o_first) / d + 1;
++    const int j0 = (o_first - a.pad - r) / d;  // exact: o_first - pad - r is a multiple of d
++    const int i_max = r <= a.in_lines - 1 ? (a.in_lines - 1 - r) / d : -1;
++    for (int m0 = 0; m0 < count; m0 += chunk) {
++      const int m1 = MinInt(m0 + chunk, count);
++      const int top = j0 + m0;
++      const int bottom = j0 + m1 - 1 + a.kernel - 1;
++      const int first = MaxInt(top, 0);
++      const int last = MinInt(bottom, i_max);
++      if (last < first) return false;
++      const Tile tile = {r + first * d, d, last - first + 1, first - top, o_first + m0 * d, d, m1 - m0, 1, 1};
++      f(tile);
++    }
++  }
++  return true;
++}
++
++// Puts a tile's input lines (each `line` values) where the int8 kernel can read them: the tensor itself for a
++// contiguous int8 tile, otherwise `buffer`. A packed input is unpacked, shifted by 8 when `shifted`.
++const int8_t* GatherTile(const Tile& tile, int line, const int8_t* data, int total, bool packed, bool shifted,
++                         int8_t* buffer);
++
++// Where the int8 kernel should write a tile's output lines, and how to put them back afterwards.
++int8_t* TileOutput(const Tile& tile, int line, int8_t* data, bool packed, int8_t* buffer);
++void ScatterTile(const Tile& tile, int line, int8_t* data, int total, bool packed, const int8_t* buffer);
++
++// Whether a tile's output goes through `buffer` (so the kernel needs an output scratch buffer).
++inline bool TileNeedsOutputBuffer(bool packed_output, bool phased_tiles) { return packed_output || phased_tiles; }
++
++// Which axis an NHWC operator is tiled along, and its line sizes. Tensors with height 1 (1-D models such as TCNs,
++// whose Conv1D layers become CONV_2D over a 1 x T image) are tiled along width; everything else along height.
++struct SpatialPlan {
++  bool along_width;
++  Axis axis;
++  int in_line;   // values per input line
++  int out_line;  // values per output line
++  int chunk;     // output lines per tile
++};
++
++inline SpatialPlan MakeSpatialPlan(int in_h, int in_w, int in_c, int out_h, int out_w, int out_c, int kernel_h,
++                                   int kernel_w, int stride_h, int stride_w, int dilation_h, int dilation_w,
++                                   int pad_h, int pad_w, int rows_per_tile, int columns_per_tile) {
++  SpatialPlan plan;
++  plan.along_width = in_h == 1 && out_h == 1;
++  if (plan.along_width) {
++    const Axis axis = {in_w, out_w, kernel_w, stride_w, dilation_w, pad_w};
++    plan.axis = axis;
++    plan.in_line = in_c;
++    plan.out_line = out_c;
++    plan.chunk = columns_per_tile;
++  } else {
++    const Axis axis = {in_h, out_h, kernel_h, stride_h, dilation_h, pad_h};
++    plan.axis = axis;
++    plan.in_line = in_w * in_c;
++    plan.out_line = out_w * out_c;
++    plan.chunk = rows_per_tile;
++  }
++  return plan;
++}
++
++// Writes a tile's extent, padding and stride along the plan's axis into CMSIS-NN dims and parameters.
++template <typename Dims, typename Params>
++inline void ApplyTileAxis(const SpatialPlan& plan, const Tile& tile, Dims* in_dims, Dims* out_dims, Params* params) {
++  if (plan.along_width) {
++    in_dims->w = tile.in_lines;
++    out_dims->w = tile.out_lines;
++    params->padding.w = tile.tile_pad;
++    params->stride.w = tile.stride;
++  } else {
++    in_dims->h = tile.in_lines;
++    out_dims->h = tile.out_lines;
++    params->padding.h = tile.tile_pad;
++    params->stride.h = tile.stride;
++  }
++}
++
++// The same for convolution parameters, which also carry a dilation.
++template <typename Dims, typename Params>
++inline void ApplyConvTile(const SpatialPlan& plan, const Tile& tile, Dims* in_dims, Dims* out_dims, Params* params) {
++  ApplyTileAxis(plan, tile, in_dims, out_dims, params);
++  if (plan.along_width) {
++    params->dilation.w = tile.dilation;
++  } else {
++    params->dilation.h = tile.dilation;
++  }
++}
 +
 +}  // namespace crest_act4
 +
 +#endif  // TENSORFLOW_LITE_MICRO_KERNELS_CREST_ACT4_H_
+diff -ruN a/src/tensorflow/lite/micro/kernels/expand_dims.cpp b/src/tensorflow/lite/micro/kernels/expand_dims.cpp
+--- a/src/tensorflow/lite/micro/kernels/expand_dims.cpp	2024-07-05 04:37:47.000000000 -0700
++++ b/src/tensorflow/lite/micro/kernels/expand_dims.cpp	2026-11-15 19:10:15.684289242 -0800
+@@ -17,6 +17,7 @@
+ #include "tensorflow/lite/kernels/internal/tensor_ctypes.h"
+ #include "tensorflow/lite/kernels/kernel_util.h"
+ #include "tensorflow/lite/micro/kernels/kernel_util.h"
++#include "tensorflow/lite/micro/kernels/crest_act4.h"
+ #include "tensorflow/lite/micro/micro_log.h"
+ #include "tensorflow/lite/micro/micro_utils.h"
+ 
+@@ -132,6 +133,11 @@
+       memCopyN(tflite::micro::GetTensorData<int8_t>(output),
+                tflite::micro::GetTensorData<int8_t>(input), flat_size);
+     } break;
++    case kTfLiteInt4: {
++      memCopyN(tflite::micro::GetTensorData<int8_t>(output),
++               tflite::micro::GetTensorData<int8_t>(input),
++               crest_act4::PackedActivations() ? crest_act4::PackedBytes(flat_size) : flat_size);
++    } break;
+     default:
+       MicroPrintf(
+           "Expand_Dims only currently supports int8 and float32, got %d.",
+diff -ruN a/src/tensorflow/lite/micro/kernels/pad.cpp b/src/tensorflow/lite/micro/kernels/pad.cpp
+--- a/src/tensorflow/lite/micro/kernels/pad.cpp	2024-07-05 04:37:47.000000000 -0700
++++ b/src/tensorflow/lite/micro/kernels/pad.cpp	2026-11-15 19:10:15.684289242 -0800
+@@ -23,6 +23,8 @@
+ #include "tensorflow/lite/kernels/kernel_util.h"
+ #include "tensorflow/lite/kernels/op_macros.h"
+ #include "tensorflow/lite/micro/kernels/kernel_util.h"
++#include "tensorflow/lite/micro/kernels/crest_act4.h"
++#include "tensorflow/lite/micro/micro_utils.h"
+ #include "tensorflow/lite/micro/micro_log.h"
+ 
+ namespace tflite {
+@@ -38,6 +40,90 @@
+   return context->AllocatePersistentBuffer(context, sizeof(OpData));
+ }
+ 
++// Collects output values in a small buffer and packs them in order.
++class PackedWriter {
++ public:
++  PackedWriter(int8_t* output, int total) : output_(output), total_(total) {}
++  void Fill(int8_t value, int count) {
++    while (count > 0) {
++      const int n = count < kCapacity - fill_ ? count : kCapacity - fill_;
++      for (int i = 0; i < n; ++i) buffer_[fill_ + i] = value;
++      fill_ += n;
++      count -= n;
++      if (fill_ == kCapacity) Flush();
++    }
++  }
++  void Copy(const int8_t* input, int input_total, int start, int count) {
++    while (count > 0) {
++      const int n = count < kCapacity - fill_ ? count : kCapacity - fill_;
++      crest_act4::Unpack(input, input_total, start, n, buffer_ + fill_);
++      fill_ += n;
++      start += n;
++      count -= n;
++      if (fill_ == kCapacity) Flush();
++    }
++  }
++  void Flush() {
++    if (fill_ == 0) return;
++    crest_act4::Pack(buffer_, total_, written_, fill_, output_);
++    written_ += fill_;
++    fill_ = 0;
++  }
++
++ private:
++  static constexpr int kCapacity = 64;
++  int8_t buffer_[kCapacity];
++  int8_t* output_;
++  int total_;
++  int written_ = 0;
++  int fill_ = 0;
++};
++
++// Pads a packed 4-bit tensor with its zero point. Dimensions are aligned to the right in a 5-D index space, and
++// each innermost run is copied whole.
++TfLiteStatus EvalPackedInt4Pad(TfLiteContext* context, const OpData* data, const TfLiteEvalTensor* input,
++                               TfLiteEvalTensor* output) {
++  const int dims = input->dims->size;
++  TF_LITE_ENSURE(context, dims >= 1 && dims <= 5);
++  int in_shape[5];
++  int out_shape[5];
++  int left[5];
++  for (int i = 0; i < 5; ++i) {
++    const int index = i - (5 - dims);
++    in_shape[i] = index < 0 ? 1 : input->dims->data[index];
++    out_shape[i] = index < 0 ? 1 : output->dims->data[index];
++    left[i] = index < 0 ? 0 : data->params.left_padding[index];
++  }
++  const int8_t* input_data = tflite::micro::GetTensorData<int8_t>(input);
++  const int input_total = static_cast<int>(ElementCount(*input->dims));
++  PackedWriter writer(tflite::micro::GetTensorData<int8_t>(output), static_cast<int>(ElementCount(*output->dims)));
++  const int8_t pad_value = static_cast<int8_t>(data->output_zero_point);
++  for (int o0 = 0; o0 < out_shape[0]; ++o0) {
++    const int i0 = o0 - left[0];
++    for (int o1 = 0; o1 < out_shape[1]; ++o1) {
++      const int i1 = o1 - left[1];
++      for (int o2 = 0; o2 < out_shape[2]; ++o2) {
++        const int i2 = o2 - left[2];
++        for (int o3 = 0; o3 < out_shape[3]; ++o3) {
++          const int i3 = o3 - left[3];
++          const bool inside = i0 >= 0 && i0 < in_shape[0] && i1 >= 0 && i1 < in_shape[1] && i2 >= 0 &&
++                              i2 < in_shape[2] && i3 >= 0 && i3 < in_shape[3];
++          if (!inside) {
++            writer.Fill(pad_value, out_shape[4]);
++            continue;
++          }
++          const int base = (((i0 * in_shape[1] + i1) * in_shape[2] + i2) * in_shape[3] + i3) * in_shape[4];
++          writer.Fill(pad_value, left[4]);
++          writer.Copy(input_data, input_total, base, in_shape[4]);
++          writer.Fill(pad_value, out_shape[4] - left[4] - in_shape[4]);
++        }
++      }
++    }
++  }
++  writer.Flush();
++  return kTfLiteOk;
++}
++
+ TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
+   TFLITE_DCHECK(node->user_data != nullptr);
+   const OpData* data = static_cast<const OpData*>(node->user_data);
+@@ -51,6 +137,11 @@
+   TfLiteEvalTensor* output =
+       tflite::micro::GetEvalOutput(context, node, /*index=*/0);
+ 
++  if (input->type == kTfLiteInt4 && crest_act4::PackedActivations()) {
++    TF_LITE_ENSURE(context, constant_values == nullptr);
++    return EvalPackedInt4Pad(context, data, input, output);
++  }
++
+   switch (input->type) {
+     case kTfLiteFloat32: {
+       float pad_value =
+@@ -70,6 +161,7 @@
+                            tflite::micro::GetTensorData<float>(output));
+       }
+     } break;
++    case kTfLiteInt4:  // container mode: one value per byte, padded like int8
+     case kTfLiteInt8: {
+       int8_t pad_value;
+       if (constant_values == nullptr) {
+@@ -189,7 +281,7 @@
+     data->params.right_padding[idx] = paddings_data[idx * 2 + 1];
+   }
+ 
+-  if (input->type == kTfLiteInt8) {
++  if (input->type == kTfLiteInt8 || input->type == kTfLiteInt4) {
+     if (constant_values == nullptr) {
+       // Quantized Pad requires that 0 is represented in the quantized
+       // range.
+diff -ruN a/src/tensorflow/lite/micro/kernels/pooling_common.cpp b/src/tensorflow/lite/micro/kernels/pooling_common.cpp
+--- a/src/tensorflow/lite/micro/kernels/pooling_common.cpp	2024-07-05 04:37:47.000000000 -0700
++++ b/src/tensorflow/lite/micro/kernels/pooling_common.cpp	2026-11-15 19:10:15.684289242 -0800
+@@ -69,7 +69,7 @@
+   if (input->type == kTfLiteFloat32) {
+     CalculateActivationRange(params->activation, &data->activation_min_f32,
+                              &data->activation_max_f32);
+-  } else if (input->type == kTfLiteInt8) {
++  } else if (input->type == kTfLiteInt8 || input->type == kTfLiteInt4) {
+     CalculateActivationRangeQuantized(context, params->activation, output,
+                                       &data->activation_min,
+                                       &data->activation_max);
 diff -ruN a/src/tensorflow/lite/micro/kernels/reduce_common.cpp b/src/tensorflow/lite/micro/kernels/reduce_common.cpp
 --- a/src/tensorflow/lite/micro/kernels/reduce_common.cpp	2024-07-05 04:37:47.000000000 -0700
-+++ b/src/tensorflow/lite/micro/kernels/reduce_common.cpp	2026-11-15 17:28:35.520561393 -0800
++++ b/src/tensorflow/lite/micro/kernels/reduce_common.cpp	2026-11-15 19:10:15.684289242 -0800
 @@ -25,6 +25,7 @@
  #include "tensorflow/lite/micro/kernels/reduce.h"
  #include "tensorflow/lite/micro/micro_log.h"
@@ -654,7 +1338,7 @@ diff -ruN a/src/tensorflow/lite/micro/kernels/reduce_common.cpp b/src/tensorflow
      context->RequestScratchBufferInArena(context, output_size * sizeof(int32_t),
                                           &op_data->temp_buffer_idx);
      op_data->input_zp = input->params.zero_point;
-@@ -198,6 +199,71 @@
+@@ -198,6 +199,63 @@
    return kTfLiteOk;
  }
  
@@ -684,21 +1368,13 @@ diff -ruN a/src/tensorflow/lite/micro/kernels/reduce_common.cpp b/src/tensorflow
 +  for (int c = 0; c < channels; ++c) temp_sum[c] = 0;
 +  const int8_t* packed = tflite::micro::GetTensorData<int8_t>(input);
 +  const int count = positions * channels;
-+  const bool planar = crest_act4::PlanarLayout(input->dims->data[2] * channels);
-+  // Unpack 8 values at a time (planar groups never straddle a row because rows are multiples of 8).
-+  int8_t values[8];
++  // Unpack 64 values at a time into a small stack buffer and add each to its channel's sum.
++  int8_t values[64];
 +  int c = 0;
-+  int index = 0;
-+  for (; index + 8 <= count; index += 8) {
-+    crest_act4::Unpack(packed, index, 8, values, planar);
-+    for (int k = 0; k < 8; ++k) {
-+      temp_sum[c] += values[k];
-+      if (++c == channels) c = 0;
-+    }
-+  }
-+  if (index < count) {
-+    crest_act4::Unpack(packed, index, count - index, values, false);
-+    for (int k = 0; index + k < count; ++k) {
++  for (int index = 0; index < count; index += 64) {
++    const int n = count - index < 64 ? count - index : 64;
++    crest_act4::Unpack(packed, count, index, n, values);
++    for (int k = 0; k < n; ++k) {
 +      temp_sum[c] += values[k];
 +      if (++c == channels) c = 0;
 +    }
@@ -726,7 +1402,7 @@ diff -ruN a/src/tensorflow/lite/micro/kernels/reduce_common.cpp b/src/tensorflow
  TfLiteStatus EvalMeanHelper(TfLiteContext* context, TfLiteNode* node,
                              OpDataReduce* op_data) {
    const TfLiteEvalTensor* input = tflite::micro::GetEvalInput(context, node, 0);
-@@ -246,6 +312,15 @@
+@@ -246,6 +304,15 @@
            context, EvalIntegerMean<int8_t>(context, node, num_axis, op_data,
                                             temp_index, resolved_axis));
      } break;
@@ -742,9 +1418,30 @@ diff -ruN a/src/tensorflow/lite/micro/kernels/reduce_common.cpp b/src/tensorflow
      case kTfLiteInt16: {
        TF_LITE_ENSURE_OK(
            context, EvalIntegerMean<int16_t>(context, node, num_axis, op_data,
+diff -ruN a/src/tensorflow/lite/micro/kernels/reshape.cpp b/src/tensorflow/lite/micro/kernels/reshape.cpp
+--- a/src/tensorflow/lite/micro/kernels/reshape.cpp	2024-07-05 04:37:47.000000000 -0700
++++ b/src/tensorflow/lite/micro/kernels/reshape.cpp	2026-11-15 19:10:15.684289242 -0800
+@@ -21,6 +21,7 @@
+ #include "tensorflow/lite/kernels/kernel_util.h"
+ #include "tensorflow/lite/kernels/op_macros.h"
+ #include "tensorflow/lite/micro/kernels/kernel_util.h"
++#include "tensorflow/lite/micro/kernels/crest_act4.h"
+ #include "tensorflow/lite/micro/memory_helpers.h"
+ #include "tensorflow/lite/micro/micro_utils.h"
+ 
+@@ -98,6 +99,9 @@
+   size_t input_bytes;
+   TF_LITE_ENSURE_STATUS(TfLiteTypeSizeOf(input->type, &input_bytes));
+   input_bytes *= ElementCount(*input->dims);
++  if (input->type == kTfLiteInt4 && crest_act4::PackedActivations()) {
++    input_bytes = crest_act4::PackedBytes(ElementCount(*input->dims));
++  }
+ 
+   // Do nothing for in-place reshape.
+   if (input->data.raw != output->data.raw) {
 diff -ruN a/src/tensorflow/lite/micro/micro_allocation_info.cpp b/src/tensorflow/lite/micro/micro_allocation_info.cpp
 --- a/src/tensorflow/lite/micro/micro_allocation_info.cpp	2024-07-05 04:37:47.000000000 -0700
-+++ b/src/tensorflow/lite/micro/micro_allocation_info.cpp	2026-11-15 17:28:35.520561393 -0800
++++ b/src/tensorflow/lite/micro/micro_allocation_info.cpp	2026-11-15 19:10:15.688289083 -0800
 @@ -23,6 +23,7 @@
  #include "tensorflow/lite/micro/memory_helpers.h"
  #include "tensorflow/lite/micro/memory_planner/greedy_memory_planner.h"
@@ -765,7 +1462,7 @@ diff -ruN a/src/tensorflow/lite/micro/micro_allocation_info.cpp b/src/tensorflow
        current->last_used = kUninitializedLifetime;
 diff -ruN a/src/third_party/cmsis_nn/Source/NNSupportFunctions/arm_nn_mat_mult_nt_t_s8.c b/src/third_party/cmsis_nn/Source/NNSupportFunctions/arm_nn_mat_mult_nt_t_s8.c
 --- a/src/third_party/cmsis_nn/Source/NNSupportFunctions/arm_nn_mat_mult_nt_t_s8.c	2024-07-05 04:37:47.000000000 -0700
-+++ b/src/third_party/cmsis_nn/Source/NNSupportFunctions/arm_nn_mat_mult_nt_t_s8.c	2026-11-15 17:28:35.524561323 -0800
++++ b/src/third_party/cmsis_nn/Source/NNSupportFunctions/arm_nn_mat_mult_nt_t_s8.c	2026-11-15 19:10:15.692288923 -0800
 @@ -70,14 +70,18 @@
          q31_t lhs_offset_contribution0 = 0;
          q31_t lhs_offset_contribution1 = 0;
